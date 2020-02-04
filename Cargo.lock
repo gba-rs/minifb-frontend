@@ -148,6 +148,7 @@ name = "minifb-frontend"
 version = "0.1.0"
 dependencies = [
  "gba-emulator 0.1.0",
+ "log 0.4.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "minifb 0.15.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 

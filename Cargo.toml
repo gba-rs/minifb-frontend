@@ -9,3 +9,4 @@ edition = "2018"
 [dependencies]
 gba-emulator = {path = "../gba-emu"}
 minifb = "0.15.3"
+log = "0.4.8"
