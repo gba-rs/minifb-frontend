@@ -6,11 +6,15 @@ use std::fs::File;
 use log::{Record, Level, Metadata, SetLoggerError};
 use log::info;
 use std::time::Instant;
+use std::collections::VecDeque;
+use average::Mean;
+
 
 use minifb::{Key, Window, WindowOptions};
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
+const FPS_BUFFER_SIZE: usize = 30;
 
 pub struct ConsoleLogger;
 
@@ -30,7 +34,7 @@ impl log::Log for ConsoleLogger {
                 record.module_path().unwrap_or_default()
             };
 
-            println!("[{}][{}] {}", target, record.level(), record.args());
+            println!("{}", record.args());
         }
     }
 
@@ -77,10 +81,15 @@ fn main() {
         panic!("{}", e);
     });
 
-    let mut gba: GBA = GBA::new(0x08000000, &bios_bytes, &rom_bytes);
+    // let mut gba: GBA = GBA::new(0x08000000, &bios_bytes, &rom_bytes);
+    let mut gba: GBA = GBA::new(0, &bios_bytes, &rom_bytes);
 
     // Limit to max ~60 fps update rate
     window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
+
+    let mut fps_counter_buffer = VecDeque::new();
+    let mut a: Mean = fps_counter_buffer.iter().collect();
+
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -110,6 +119,11 @@ fn main() {
             .update_with_buffer(&gba.gpu.frame_buffer, WIDTH, HEIGHT)
             .unwrap();
 
-        window.set_title(&format!("GBA Emu: {} FPS", 1f64 / now.elapsed().as_secs_f64()));
+        fps_counter_buffer.push_back(1f64 / now.elapsed().as_secs_f64());
+        if fps_counter_buffer.len() == FPS_BUFFER_SIZE {
+            a = fps_counter_buffer.drain(0..FPS_BUFFER_SIZE).collect();
+        }
+
+        window.set_title(&format!("GBA Emu: {} FPS", a.mean()));
     }
 }
