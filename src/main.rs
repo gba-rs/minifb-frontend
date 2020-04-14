@@ -1,5 +1,6 @@
 extern crate minifb;
 use gba_emulator::gba::GBA;
+use gba_emulator::gamepak::GamePack;
 use std::env;
 use std::io::prelude::*;
 use std::fs::File;
@@ -59,14 +60,11 @@ fn main() {
     }
 
     let args: Vec<String> = env::args().collect();
+    let mut game_pack = GamePack::new(&args[1], &args[2]);
 
-    let rom = File::open(&args[2]);
-    let mut rom_bytes = Vec::new();
-    rom.unwrap().read_to_end(&mut rom_bytes);
-
-    let bios = File::open(&args[1]);
-    let mut bios_bytes = Vec::new();
-    bios.unwrap().read_to_end(&mut bios_bytes);
+    if args.len() == 4 {
+        game_pack.load_save_data(&args[3]);
+    }
 
     let mut window = Window::new(
         "GBA Emulator",
@@ -82,14 +80,14 @@ fn main() {
     });
 
     // let mut gba: GBA = GBA::new(0x08000000, &bios_bytes, &rom_bytes);
-    let mut gba: GBA = GBA::new(0, &bios_bytes, &rom_bytes);
+    let mut gba: GBA = GBA::new(0, &game_pack);
+
 
     // Limit to max ~60 fps update rate
     window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
 
     let mut fps_counter_buffer = VecDeque::new();
     let mut a: Mean = fps_counter_buffer.iter().collect();
-
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
