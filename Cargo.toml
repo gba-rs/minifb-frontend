@@ -11,7 +11,8 @@ gba-emulator = {path = "../gba-emu"}
 minifb = "0.15.3"
 log = "0.4.8"
 average="0.10.4"
-
+clap = "3.0.0-beta.4"
+gilrs = "0.8.1"
 
 [profile.release]
 debug = true
