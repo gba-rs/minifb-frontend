@@ -1,5 +1,6 @@
 extern crate minifb;
 use gba_emulator::{gamepak::GamePack, gba::GBA};
+use gilrs::{Button, Event, Gilrs};
 use std::{fs::OpenOptions, io::prelude::*};
 use log::{Level, Metadata, Record, SetLoggerError, error, info};
 use std::{collections::VecDeque, time::Instant};
@@ -57,9 +58,44 @@ struct Opts {
     fps_counter: bool
 }
 
+fn read_save_file(gba: &mut GBA, save_path: &String) {
+    if let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(save_path) {
+        let mut save_data: Vec<u8> = Vec::new();
+        let read_result = file.read_to_end(&mut save_data);
+        match read_result {
+            Ok(_) => {
+                gba.load_save_file(&save_data);
+                info!("Loaded save file {}", &save_path);
+            },
+            Err(_) => error!("Error reading {} to end", &save_path),
+        }
+    } else {
+        error!("Failed to open {}", &save_path);
+    }
+}
+
+fn write_save_file(gba: &mut GBA, save_path: &String) {
+    if let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(&save_path) {
+        let _ = file.write_all(&gba.get_save_data()[..]);
+    } else {
+        error!("Failed to open {}", &save_path);
+    }
+}
+
 fn main() {
+    match init_logger() {
+        Ok(_) => {
+            info!("Logger initialized succesfully");
+        },
+        Err(_) => {
+            info!("Logger failed to initialize");
+        }
+    }
+
     let opts: Opts = Opts::parse();
+    let mut gilrs = Gilrs::new().unwrap();
     let game_pack = GamePack::new(&opts.bios_file, &opts.rom_file);
+    let mut active_gamepad = None;
 
     let mut gba = if opts.skip_bios {
         GBA::new(0x08000000, &game_pack)
@@ -68,21 +104,9 @@ fn main() {
     };
 
     if let Some(ref save_path) = opts.save_file {
-        if let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(&save_path) {
-            let mut save_data: Vec<u8> = Vec::new();
-            let read_result = file.read_to_end(&mut save_data);
-            match read_result {
-                Ok(_) => {
-                    gba.load_save_file(&save_data);
-                    info!("Loaded save file {}", &save_path);
-                },
-                Err(_) => error!("Error reading {} to end", &save_path),
-            }
-        } else {
-            error!("Failed to open {}", &save_path);
-        }
+        read_save_file(&mut gba, save_path);
     } else {
-        info!("No save file provided, will create");
+        info!("No save file provided");
     }
 
     let mut window = Window::new(
@@ -113,6 +137,24 @@ fn main() {
 
         gba.key_status.set_register(0xFFFF);
 
+        // poll for any gamepad input events
+        while let Some(Event { id, event, time }) = gilrs.next_event() {
+            active_gamepad = Some(id);
+        }
+
+        if let Some(gamepad) = active_gamepad.map(|id| gilrs.gamepad(id)) {
+            if gamepad.is_pressed(Button::DPadUp) { gba.key_status.set_dpad_up(0); }
+            if gamepad.is_pressed(Button::DPadDown) { gba.key_status.set_dpad_down(0); }
+            if gamepad.is_pressed(Button::DPadLeft) { gba.key_status.set_dpad_left(0); }
+            if gamepad.is_pressed(Button::DPadRight) { gba.key_status.set_dpad_right(0); }
+            if gamepad.is_pressed(Button::South) { gba.key_status.set_button_a(0); }
+            if gamepad.is_pressed(Button::East) { gba.key_status.set_button_b(0); }
+            if gamepad.is_pressed(Button::RightTrigger) { gba.key_status.set_button_r(0); }
+            if gamepad.is_pressed(Button::LeftTrigger) { gba.key_status.set_button_l(0); }
+            if gamepad.is_pressed(Button::Select) { gba.key_status.set_button_select(0); }
+            if gamepad.is_pressed(Button::Start) { gba.key_status.set_button_start(0); }
+        }
+        
         window.get_keys().map(|keys| {
             for t in keys {
                 match t {
@@ -144,12 +186,9 @@ fn main() {
         }
     }
     
-
     if let Some(ref save_path) = opts.save_file {
-        if let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(&save_path) {
-            let _ = file.write_all(&gba.get_save_data()[..]);
-        } else {
-            error!("Failed to open {}", &save_path);
-        }
+        write_save_file(&mut gba, save_path);
+    } else {
+        info!("No save file provided");
     }
 }
