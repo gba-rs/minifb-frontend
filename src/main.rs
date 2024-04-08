@@ -4,7 +4,7 @@ use gilrs::{Button, Event, Gilrs};
 use std::{fs::OpenOptions, io::prelude::*};
 use log::{Level, Metadata, Record, SetLoggerError, error, info};
 use std::{collections::VecDeque, time::Instant};
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, Window, WindowOptions, ScaleMode};
 use clap::{AppSettings, Clap};
 use average::Mean;
 
@@ -50,6 +50,8 @@ struct Opts {
     bios_file: String,
     rom_file: String,
     save_file: Option<String>,
+    res_width: Option<usize>,
+    res_height: Option<usize>,
     #[clap(short, long)]
     skip_bios: bool,
     #[clap(short, long)]
@@ -94,7 +96,8 @@ fn main() {
 
     let opts: Opts = Opts::parse();
     let mut gilrs = Gilrs::new().unwrap();
-    let game_pack = GamePack::new(&opts.bios_file, &opts.rom_file);
+    let mut game_pack = GamePack::new(&opts.bios_file, &opts.rom_file);
+    game_pack.read_title();
     let mut active_gamepad = None;
 
     let mut gba = if opts.skip_bios {
@@ -109,12 +112,25 @@ fn main() {
         info!("No save file provided");
     }
 
+    let width = if let Some(res_width) = opts.res_width {
+        res_width
+    } else {
+        WIDTH
+    };
+
+    let height = if let Some(res_height) = opts.res_height {
+        res_height
+    } else {
+        HEIGHT
+    };
+
     let mut window = Window::new(
-        "GBA Emulator",
-        WIDTH,
-        HEIGHT,
+        &game_pack.title,
+        width,
+        height,
         WindowOptions{
             resize: true,
+            scale_mode: ScaleMode::AspectRatioStretch,
             ..WindowOptions::default()
         },
     )
@@ -134,6 +150,15 @@ fn main() {
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
         gba.frame();
+        if gba.memory_bus.mem_map.new_save_data {
+            info!("Got new save data, saving");
+            if let Some(ref save_path) = opts.save_file {
+                write_save_file(&mut gba, save_path);
+            } else {
+                info!("No save file provided");
+            }
+            gba.memory_bus.mem_map.new_save_data = false;
+        }
 
         gba.key_status.set_register(0xFFFF);
 
@@ -186,9 +211,5 @@ fn main() {
         }
     }
     
-    if let Some(ref save_path) = opts.save_file {
-        write_save_file(&mut gba, save_path);
-    } else {
-        info!("No save file provided");
-    }
+
 }
