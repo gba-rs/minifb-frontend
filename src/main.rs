@@ -5,8 +5,9 @@ use std::{fs::OpenOptions, io::prelude::*};
 use log::{Level, Metadata, Record, SetLoggerError, error, info};
 use std::{collections::VecDeque, time::Instant};
 use minifb::{Key, Window, WindowOptions};
-use clap::{AppSettings, Clap};
 use average::Mean;
+use clap::Parser;
+
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
@@ -43,18 +44,17 @@ pub fn init_logger() -> Result<(), SetLoggerError> {
     Ok(())
 }
 
-#[derive(Clap)]
-#[clap(version = "1.0", author = "gba-rs team <https://github.com/gba-rs/>")]
-#[clap(setting = AppSettings::ColoredHelp)]
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
 struct Opts {
     bios_file: String,
     rom_file: String,
     save_file: Option<String>,
-    #[clap(short, long)]
+    #[arg(short, long)]
     skip_bios: bool,
-    #[clap(short, long)]
+    #[arg(short, long)]
     frame_cap: Option<i32>,
-    #[clap(short, long)]
+    #[arg(short, long)]
     fps_counter: bool
 }
 
