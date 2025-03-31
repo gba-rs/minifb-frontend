@@ -5,8 +5,9 @@ use std::{fs::OpenOptions, io::prelude::*};
 use log::{Level, Metadata, Record, SetLoggerError, error, info};
 use std::{collections::VecDeque, time::Instant};
 use minifb::{Key, Window, WindowOptions};
-use clap::{AppSettings, Clap};
 use average::Mean;
+use clap::Parser;
+
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
@@ -43,18 +44,17 @@ pub fn init_logger() -> Result<(), SetLoggerError> {
     Ok(())
 }
 
-#[derive(Clap)]
-#[clap(version = "1.0", author = "gba-rs team <https://github.com/gba-rs/>")]
-#[clap(setting = AppSettings::ColoredHelp)]
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
 struct Opts {
     bios_file: String,
     rom_file: String,
     save_file: Option<String>,
-    #[clap(short, long)]
+    #[arg(short, long)]
     skip_bios: bool,
-    #[clap(short, long)]
-    frame_cap: Option<i32>,
-    #[clap(short, long)]
+    #[arg(short, long)]
+    frame_cap: Option<usize>,
+    #[arg(short, long)]
     fps_counter: bool
 }
 
@@ -124,8 +124,7 @@ fn main() {
 
     // Limit frame rate
     if let Some(frame_cap) = opts.frame_cap {
-        let frame_time = (1.0 / (frame_cap as f32)) * 1_000_000.0;
-        window.limit_update_rate(Some(std::time::Duration::from_micros(frame_time as u64)));
+        window.set_target_fps(frame_cap);
     }
 
     let mut fps_counter_buffer = VecDeque::new();
@@ -138,7 +137,7 @@ fn main() {
         gba.key_status.set_register(0xFFFF);
 
         // poll for any gamepad input events
-        while let Some(Event { id, event, time }) = gilrs.next_event() {
+        while let Some(Event { id, ..}) = gilrs.next_event() {
             active_gamepad = Some(id);
         }
 
@@ -155,21 +154,19 @@ fn main() {
             if gamepad.is_pressed(Button::Start) { gba.key_status.set_button_start(0); }
         }
         
-        window.get_keys().map(|keys| {
-            for t in keys {
-                match t {
-                    Key::W => gba.key_status.set_dpad_up(0),
-                    Key::S => gba.key_status.set_dpad_down(0),
-                    Key::A => gba.key_status.set_dpad_left(0),
-                    Key::D => gba.key_status.set_dpad_right(0),
-                    Key::H => gba.key_status.set_button_a(0),
-                    Key::J => gba.key_status.set_button_b(0),
-                    Key::R => gba.key_status.set_button_r(0),
-                    Key::Q => gba.key_status.set_button_l(0),
-                    Key::Enter => gba.key_status.set_button_start(0),
-                    Key::Backspace => gba.key_status.set_button_select(0),
-                    _ => ()
-                }
+        window.get_keys().iter().for_each(|key| {
+            match key {
+                Key::W => gba.key_status.set_dpad_up(0),
+                Key::S => gba.key_status.set_dpad_down(0),
+                Key::A => gba.key_status.set_dpad_left(0),
+                Key::D => gba.key_status.set_dpad_right(0),
+                Key::H => gba.key_status.set_button_a(0),
+                Key::J => gba.key_status.set_button_b(0),
+                Key::R => gba.key_status.set_button_r(0),
+                Key::Q => gba.key_status.set_button_l(0),
+                Key::Enter => gba.key_status.set_button_start(0),
+                Key::Backspace => gba.key_status.set_button_select(0),
+                _ => ()
             }
         });
 
