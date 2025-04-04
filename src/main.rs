@@ -76,16 +76,19 @@ fn read_save_file(gba: &mut GBA, save_path: &String) {
     }
 }
 
-fn read_save_state(save_path: &String, gba_pc: u32, game_pack: &GamePack, register_mem: &mut bool) -> GBA {
+fn read_save_state(save_path: &String, gba_pc: u32, game_pack: &GamePack) -> GBA {
     if let Ok(mut file) = OpenOptions::new().create(false).read(true).write(true).open(&save_path) {
         let mut binary_from_file = Vec::new();
         let _ = file.read_to_end(&mut binary_from_file).unwrap();
+        let mut gba: GBA = bincode::deserialize(&binary_from_file).expect("Failed to deserialize");
+        gba.register_memory();
+        gba.load_bios(&game_pack.bios);
+        gba.load_rom(&game_pack.rom);
 
-        *register_mem = true;
-        return bincode::deserialize(&binary_from_file).expect("Failed to deserialize");
+        return gba;
     } else {
         error!("Failed to open {}", &save_path);
-    } 
+    }
     return GBA::new(gba_pc, &game_pack);
 }
 
@@ -127,20 +130,11 @@ fn main() {
         0x0
     };
 
-    let mut register_mem = false;
     let mut gba = if let Some(ref save_path) = opts.save_state {
-        read_save_state(save_path, gba_pc, &game_pack, &mut register_mem)
+        read_save_state(save_path, gba_pc, &game_pack) 
     } else {
         GBA::new(gba_pc, &game_pack)
     };
-
-    if register_mem {
-        let pc_content = gba.cpu.get_pc();
-        info!("PC Content: {:08x} {}", pc_content, gba.cpu.last_instruction);
-        gba.register_memory();
-        gba.load_bios(&game_pack.bios);
-        gba.load_rom(&game_pack.rom);
-    }
 
     if let Some(ref save_path) = opts.save_file {
         read_save_file(&mut gba, save_path);
@@ -154,6 +148,7 @@ fn main() {
         HEIGHT,
         WindowOptions{
             resize: true,
+            scale: minifb::Scale::X8,
             ..WindowOptions::default()
         },
     )
