@@ -1,5 +1,5 @@
 extern crate minifb;
-use gba_emulator::{gamepak::GamePack, gba::GBA};
+use gba_emulator::{cpu::cpu::CPU, gamepak::{self, GamePack}, gba::GBA};
 use gilrs::{Button, Event, Gilrs};
 use std::{fs::OpenOptions, io::prelude::*};
 use log::{Level, Metadata, Record, SetLoggerError, error, info};
@@ -55,7 +55,9 @@ struct Opts {
     #[arg(short, long)]
     frame_cap: Option<usize>,
     #[arg(short, long)]
-    fps_counter: bool
+    fps_counter: bool,
+    #[arg(short, long)]
+    save_state: Option<String>
 }
 
 fn read_save_file(gba: &mut GBA, save_path: &String) {
@@ -69,6 +71,31 @@ fn read_save_file(gba: &mut GBA, save_path: &String) {
             },
             Err(_) => error!("Error reading {} to end", &save_path),
         }
+    } else {
+        error!("Failed to open {}", &save_path);
+    }
+}
+
+fn read_save_state(save_path: &String, gba_pc: u32, game_pack: &GamePack) -> GBA {
+    if let Ok(mut file) = OpenOptions::new().create(false).read(true).write(true).open(&save_path) {
+        let mut binary_from_file = Vec::new();
+        let _ = file.read_to_end(&mut binary_from_file).unwrap();
+        let mut gba: GBA = bincode::deserialize(&binary_from_file).expect("Failed to deserialize");
+        gba.register_memory();
+        gba.load_bios(&game_pack.bios);
+        gba.load_rom(&game_pack.rom);
+
+        return gba;
+    } else {
+        error!("Failed to open {}", &save_path);
+    }
+    return GBA::new(gba_pc, &game_pack);
+}
+
+fn write_save_state(gba: &mut GBA, save_path: &String) {
+    if let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(&save_path) {
+        let binary = bincode::serialize(&gba).unwrap();
+        let _ = file.write_all(&binary);
     } else {
         error!("Failed to open {}", &save_path);
     }
@@ -97,10 +124,16 @@ fn main() {
     let game_pack = GamePack::new(&opts.bios_file, &opts.rom_file);
     let mut active_gamepad = None;
 
-    let mut gba = if opts.skip_bios {
-        GBA::new(0x08000000, &game_pack)
+    let gba_pc = if opts.skip_bios {
+        0x08000000
     } else {
-        GBA::new(0, &game_pack)
+        0x0
+    };
+
+    let mut gba = if let Some(ref save_path) = opts.save_state {
+        read_save_state(save_path, gba_pc, &game_pack) 
+    } else {
+        GBA::new(gba_pc, &game_pack)
     };
 
     if let Some(ref save_path) = opts.save_file {
@@ -115,6 +148,7 @@ fn main() {
         HEIGHT,
         WindowOptions{
             resize: true,
+            scale: minifb::Scale::X8,
             ..WindowOptions::default()
         },
     )
@@ -187,5 +221,11 @@ fn main() {
         write_save_file(&mut gba, save_path);
     } else {
         info!("No save file provided");
+    }
+
+    if let Some(ref save_path) = opts.save_state {
+        write_save_state(&mut gba, save_path);
+    } else {
+        info!("No save state file provided");
     }
 }
