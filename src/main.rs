@@ -50,13 +50,17 @@ struct Opts {
     bios_file: String,
     rom_file: String,
     save_file: Option<String>,
-    #[arg(short, long)]
+    /// Skip the BIOS boot animation and start execution at the ROM entry point.
+    #[arg(short = 'b', long)]
     skip_bios: bool,
-    #[arg(short, long)]
+    /// Cap emulation to this many frames per second.
+    #[arg(short = 'c', long)]
     frame_cap: Option<usize>,
-    #[arg(short, long)]
+    /// Print an FPS counter to the log.
+    #[arg(short = 'f', long)]
     fps_counter: bool,
-    #[arg(short, long)]
+    /// Resume from a save state file instead of a cold boot.
+    #[arg(short = 's', long)]
     save_state: Option<String>
 }
 
@@ -121,7 +125,13 @@ fn main() {
 
     let opts: Opts = Opts::parse();
     let mut gilrs = Gilrs::new().unwrap();
-    let game_pack = GamePack::new(&opts.bios_file, &opts.rom_file);
+    let game_pack = match GamePack::load(&opts.bios_file, &opts.rom_file) {
+        Ok(pack) => pack,
+        Err(e) => {
+            error!("{}", e);
+            std::process::exit(1);
+        }
+    };
     let mut active_gamepad = None;
 
     let gba_pc = if opts.skip_bios {
