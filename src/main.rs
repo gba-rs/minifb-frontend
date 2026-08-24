@@ -1,5 +1,5 @@
 extern crate minifb;
-use gba_emulator::{cpu::cpu::CPU, gamepak::{self, GamePack}, gba::GBA};
+use gba_emulator::{gamepak::GamePack, gba::GBA};
 use gilrs::{Button, Event, Gilrs};
 use std::{fs::{File, OpenOptions}, io::prelude::*};
 use std::sync::Mutex;
@@ -7,11 +7,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use log::{Level, Metadata, Record, SetLoggerError, error, info};
 use std::{collections::VecDeque, time::Instant};
+use std::path::{Path, PathBuf};
 use minifb::{Key, Window, WindowOptions};
 use average::Mean;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{HeapRb, HeapConsumer};
+use muda::{Menu, Submenu, MenuItem, MenuEvent, PredefinedMenuItem, IsMenuItem};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 
 const WIDTH: usize = 240;
@@ -75,8 +78,8 @@ pub fn init_logger() -> Result<(), SetLoggerError> {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Opts {
-    bios_file: String,
-    rom_file: String,
+    bios_file: Option<String>,
+    rom_file: Option<String>,
     save_file: Option<String>,
     /// Skip the BIOS boot animation and start execution at the ROM entry point.
     #[arg(short = 'b', long)]
@@ -471,6 +474,212 @@ fn to_device_channels(stereo: &[i16], channels: u16) -> Vec<i16> {
     output
 }
 
+const SAVE_STATE_SLOTS: usize = 9;
+const BIOS_FILENAME: &str = "gba_bios.bin";
+const GBA_BIOS_SIZE: u64 = 16384;
+
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn FreeConsole() -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn detach_console() {
+    unsafe { FreeConsole(); }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detach_console() {}
+
+fn is_valid_bios_size(byte_len: u64) -> bool {
+    byte_len == GBA_BIOS_SIZE
+}
+
+fn find_local_bios() -> Option<PathBuf> {
+    let path = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join(BIOS_FILENAME);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if is_valid_bios_size(metadata.len()) {
+        Some(path)
+    } else {
+        error!(
+            "{} exists but is {} bytes (expected {}); ignoring it",
+            path.display(), metadata.len(), GBA_BIOS_SIZE
+        );
+        None
+    }
+}
+
+fn save_path_for_rom(rom_path: &Path) -> PathBuf {
+    rom_path.with_extension("sav")
+}
+
+fn save_state_path_for_slot(rom_path: &Path, slot: usize) -> PathBuf {
+    rom_path.with_extension(format!("state{}", slot))
+}
+
+struct RunningGame {
+    gba: GBA,
+    game_pack: GamePack,
+    gba_pc: u32,
+    rom_path: PathBuf,
+    save_path: PathBuf,
+}
+
+fn open_rom(bios_path: &str, rom_path: &Path, skip_bios: bool) -> Option<RunningGame> {
+    let rom_path_string = rom_path.to_string_lossy().to_string();
+    let game_pack = match GamePack::load(bios_path, &rom_path_string) {
+        Ok(pack) => pack,
+        Err(e) => {
+            error!("{}", e);
+            return None;
+        }
+    };
+
+    let gba_pc = if skip_bios { 0x08000000 } else { 0x0 };
+    let mut gba = GBA::new(gba_pc, &game_pack);
+
+    let save_path = save_path_for_rom(rom_path);
+    if save_path.exists() {
+        read_save_file(&mut gba, &save_path.to_string_lossy().to_string());
+    } else {
+        info!("No existing save file for {}", rom_path.display());
+    }
+
+    Some(RunningGame {
+        gba,
+        game_pack,
+        gba_pc,
+        rom_path: rom_path.to_path_buf(),
+        save_path,
+    })
+}
+
+struct AppMenu {
+    #[allow(dead_code)]
+    menu: Menu,
+    open_rom: MenuItem,
+    exit: MenuItem,
+    pause: MenuItem,
+    reset: MenuItem,
+    select_save_file: MenuItem,
+    save_state_slots: Vec<MenuItem>,
+    load_state_slots: Vec<MenuItem>,
+    emulation_menu: Submenu,
+    save_menu: Submenu,
+    #[allow(dead_code)]
+    settings_menu: Submenu,
+}
+
+impl AppMenu {
+    fn set_game_loaded(&self, loaded: bool) {
+        self.emulation_menu.set_enabled(loaded);
+        self.save_menu.set_enabled(loaded);
+    }
+
+    fn refresh_state_slots(&self, rom_path: Option<&Path>) {
+        for (i, item) in self.load_state_slots.iter().enumerate() {
+            let exists = rom_path
+                .map(|p| save_state_path_for_slot(p, i + 1).exists())
+                .unwrap_or(false);
+            item.set_enabled(exists);
+        }
+    }
+}
+
+fn build_menu(window: &Window) -> AppMenu {
+    let menu = Menu::new();
+
+    let open_rom = MenuItem::new("Open ROM...", true, None);
+    let exit = MenuItem::new("Exit", true, None);
+    let file_menu = Submenu::with_items(
+        "File",
+        true,
+        &[
+            &open_rom,
+            &PredefinedMenuItem::separator(),
+            &exit,
+        ],
+    )
+    .expect("failed to build File menu");
+
+    let pause = MenuItem::new("Pause", true, None);
+    let reset = MenuItem::new("Reset", true, None);
+    let emulation_menu = Submenu::with_items("Emulation", true, &[&pause, &reset])
+        .expect("failed to build Emulation menu");
+
+    let save_state_slots: Vec<MenuItem> = (1..=SAVE_STATE_SLOTS)
+        .map(|i| MenuItem::new(format!("Slot {}", i), true, None))
+        .collect();
+    let load_state_slots: Vec<MenuItem> = (1..=SAVE_STATE_SLOTS)
+        .map(|i| MenuItem::new(format!("Slot {}", i), true, None))
+        .collect();
+
+    let save_state_refs: Vec<&dyn IsMenuItem> = save_state_slots
+        .iter()
+        .map(|item| item as &dyn IsMenuItem)
+        .collect();
+    let load_state_refs: Vec<&dyn IsMenuItem> = load_state_slots
+        .iter()
+        .map(|item| item as &dyn IsMenuItem)
+        .collect();
+
+    let save_state_submenu = Submenu::with_items("Save State", true, &save_state_refs)
+        .expect("failed to build Save State submenu");
+    let load_state_submenu = Submenu::with_items("Load State", true, &load_state_refs)
+        .expect("failed to build Load State submenu");
+    let select_save_file = MenuItem::new("Select Save File...", true, None);
+
+    let save_menu = Submenu::with_items(
+        "Save",
+        true,
+        &[
+            &save_state_submenu,
+            &load_state_submenu,
+            &PredefinedMenuItem::separator(),
+            &select_save_file,
+        ],
+    )
+    .expect("failed to build Save menu");
+
+    let settings_menu = Submenu::new("Settings", true);
+
+    menu.append(&file_menu).expect("failed to append File menu");
+    menu.append(&emulation_menu).expect("failed to append Emulation menu");
+    menu.append(&save_menu).expect("failed to append Save menu");
+    menu.append(&settings_menu).expect("failed to append Settings menu");
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
+                unsafe {
+                    menu.init_for_hwnd(win32_handle.hwnd.get())
+                        .expect("failed to attach menu bar to window");
+                }
+            }
+        }
+    }
+
+    let app_menu = AppMenu {
+        menu,
+        open_rom,
+        exit,
+        pause,
+        reset,
+        select_save_file,
+        save_state_slots,
+        load_state_slots,
+        emulation_menu,
+        save_menu,
+        settings_menu,
+    };
+    app_menu.set_game_loaded(false);
+    app_menu
+}
+
 fn main() {
     match init_logger() {
         Ok(_) => {
@@ -483,34 +692,39 @@ fn main() {
 
     let opts: Opts = Opts::parse();
     let mut gilrs = Gilrs::new().unwrap();
-    let game_pack = match GamePack::load(&opts.bios_file, &opts.rom_file) {
-        Ok(pack) => pack,
-        Err(e) => {
-            error!("{}", e);
-            std::process::exit(1);
-        }
-    };
     let mut active_gamepad = None;
 
-    let gba_pc = if opts.skip_bios {
-        0x08000000
-    } else {
-        0x0
-    };
-
-    let mut gba = if let Some(ref save_path) = opts.save_state {
-        read_save_state(save_path, gba_pc, &game_pack) 
-    } else {
-        GBA::new(gba_pc, &game_pack)
-    };
-
-    if let Some(ref save_path) = opts.save_file {
-        read_save_file(&mut gba, save_path);
-    } else {
-        info!("No save file provided");
-    }
-
     if let Some(frame_count) = opts.headless_frames {
+        let bios_file = opts.bios_file.clone().unwrap_or_else(|| {
+            error!("--headless-frames requires a BIOS file argument");
+            std::process::exit(1);
+        });
+        let rom_file = opts.rom_file.clone().unwrap_or_else(|| {
+            error!("--headless-frames requires a ROM file argument");
+            std::process::exit(1);
+        });
+        let game_pack = match GamePack::load(&bios_file, &rom_file) {
+            Ok(pack) => pack,
+            Err(e) => {
+                error!("{}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let gba_pc = if opts.skip_bios { 0x08000000 } else { 0x0 };
+
+        let mut gba = if let Some(ref save_path) = opts.save_state {
+            read_save_state(save_path, gba_pc, &game_pack)
+        } else {
+            GBA::new(gba_pc, &game_pack)
+        };
+
+        if let Some(ref save_path) = opts.save_file {
+            read_save_file(&mut gba, save_path);
+        } else {
+            info!("No save file provided");
+        }
+
         let input_schedule = opts.headless_input.as_deref().map(parse_headless_input).unwrap_or_default();
         for frame_index in 0..frame_count {
             gba.key_status.set_register(0xFFFF);
@@ -540,6 +754,8 @@ fn main() {
         return;
     }
 
+    detach_console();
+
     let mut window = Window::new(
         "GBA Emulator",
         WIDTH,
@@ -553,6 +769,63 @@ fn main() {
     .unwrap_or_else(|e| {
         panic!("{}", e);
     });
+
+    let app_menu = build_menu(&window);
+    let local_bios_path = find_local_bios();
+    app_menu.open_rom.set_enabled(local_bios_path.is_some());
+    if local_bios_path.is_none() {
+        let bios_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        error!(
+            "No {} found in {}; Open ROM is disabled until it's placed there",
+            BIOS_FILENAME, bios_dir.display()
+        );
+        rfd::MessageDialog::new()
+            .set_title("BIOS not found")
+            .set_description(format!(
+                "Place a valid {} ({} bytes) in:\n{}\n\nOpen ROM is disabled until then.",
+                BIOS_FILENAME, GBA_BIOS_SIZE, bios_dir.display()
+            ))
+            .set_level(rfd::MessageLevel::Warning)
+            .show();
+    }
+    let blank_buffer = vec![0u32; WIDTH * HEIGHT];
+    let mut paused = false;
+    let mut should_exit = false;
+
+    let mut current: Option<RunningGame> = if let (Some(bios_file), Some(rom_file)) =
+        (opts.bios_file.clone(), opts.rom_file.clone())
+    {
+        let rom_path = PathBuf::from(&rom_file);
+        let gba_pc = if opts.skip_bios { 0x08000000 } else { 0x0 };
+        match GamePack::load(&bios_file, &rom_file) {
+            Ok(game_pack) => {
+                let mut gba = if let Some(ref save_path) = opts.save_state {
+                    read_save_state(save_path, gba_pc, &game_pack)
+                } else {
+                    GBA::new(gba_pc, &game_pack)
+                };
+                let save_path = match &opts.save_file {
+                    Some(path) => PathBuf::from(path),
+                    None => save_path_for_rom(&rom_path),
+                };
+                if save_path.exists() {
+                    read_save_file(&mut gba, &save_path.to_string_lossy().to_string());
+                }
+                Some(RunningGame { gba, game_pack, gba_pc, rom_path, save_path })
+            }
+            Err(e) => {
+                error!("{}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    app_menu.set_game_loaded(current.is_some());
+    app_menu.refresh_state_slots(current.as_ref().map(|g| g.rom_path.as_path()));
 
     let mut fps_counter_buffer = VecDeque::new();
     let mut a: Mean = fps_counter_buffer.iter().collect();
@@ -577,12 +850,14 @@ fn main() {
 
     // Pre-fill a ~200ms cushion before starting playback to absorb early jitter.
     let warmup_target_samples = (device_sample_rate as usize) * (device_channels as usize) / 5;
-    while audio_producer.len() < warmup_target_samples {
-        gba.frame();
-        let new_samples = std::mem::take(&mut gba.apu.sample_buffer);
-        let resampled = resampler.process(&new_samples);
-        let device_samples = to_device_channels(&resampled, device_channels);
-        audio_producer.push_slice(&device_samples);
+    if let Some(game) = current.as_mut() {
+        while audio_producer.len() < warmup_target_samples {
+            game.gba.frame();
+            let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
+            let resampled = resampler.process(&new_samples);
+            let device_samples = to_device_channels(&resampled, device_channels);
+            audio_producer.push_slice(&device_samples);
+        }
     }
 
     let underrun_count = Arc::new(AtomicU64::new(0));
@@ -610,85 +885,155 @@ fn main() {
     let mut last_instant = Instant::now();
     let mut last_audio_stats_log = Instant::now();
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    while window.is_open() && !window.is_key_down(Key::Escape) && !should_exit {
         let now = Instant::now();
 
-        if audio_active && opts.frame_cap.is_none() {
-            let dt = now.duration_since(last_instant).as_secs_f64();
-            last_instant = now;
-            time_accumulator = (time_accumulator + dt).min(GBA_FRAME_SECONDS * MAX_CATCHUP_FRAMES as f64);
-
-            let mut emulated_this_iteration = false;
-            while time_accumulator >= GBA_FRAME_SECONDS {
-                gba.frame();
-                emulated_this_iteration = true;
-                time_accumulator -= GBA_FRAME_SECONDS;
-
-                let new_samples = std::mem::take(&mut gba.apu.sample_buffer);
-                let resampled = resampler.process(&new_samples);
-                let device_samples = to_device_channels(&resampled, device_channels);
-                let written = audio_producer.push_slice(&device_samples);
-                overrun_count += (device_samples.len() - written) as u64;
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == app_menu.open_rom.id() {
+                if let Some(bios_path) = &local_bios_path {
+                    if let Some(rom_path) = rfd::FileDialog::new().add_filter("GBA ROM", &["gba"]).pick_file() {
+                        if let Some(mut game) = current.take() {
+                            write_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
+                        }
+                        if let Some(new_game) = open_rom(&bios_path.to_string_lossy(), &rom_path, opts.skip_bios) {
+                            app_menu.refresh_state_slots(Some(&new_game.rom_path));
+                            app_menu.set_game_loaded(true);
+                            paused = false;
+                            current = Some(new_game);
+                        } else {
+                            app_menu.set_game_loaded(false);
+                        }
+                    }
+                }
+            } else if event.id == app_menu.exit.id() {
+                should_exit = true;
+            } else if event.id == app_menu.pause.id() {
+                paused = !paused;
+                let _ = app_menu.pause.set_text(if paused { "Resume" } else { "Pause" });
+            } else if event.id == app_menu.reset.id() {
+                if let Some(game) = current.as_mut() {
+                    write_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
+                    let mut fresh_gba = GBA::new(game.gba_pc, &game.game_pack);
+                    if game.save_path.exists() {
+                        read_save_file(&mut fresh_gba, &game.save_path.to_string_lossy().to_string());
+                    }
+                    game.gba = fresh_gba;
+                    paused = false;
+                }
+            } else if event.id == app_menu.select_save_file.id() {
+                if let Some(game) = current.as_mut() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("GBA save file", &["sav"]).pick_file() {
+                        game.save_path = path;
+                        read_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
+                    }
+                }
+            } else if let Some(slot) = app_menu.save_state_slots.iter().position(|item| event.id == item.id()) {
+                if let Some(game) = current.as_mut() {
+                    let slot_path = save_state_path_for_slot(&game.rom_path, slot + 1);
+                    write_save_state(&mut game.gba, &slot_path.to_string_lossy().to_string());
+                    app_menu.refresh_state_slots(Some(&game.rom_path));
+                }
+            } else if let Some(slot) = app_menu.load_state_slots.iter().position(|item| event.id == item.id()) {
+                if let Some(game) = current.as_mut() {
+                    let slot_path = save_state_path_for_slot(&game.rom_path, slot + 1);
+                    if slot_path.exists() {
+                        game.gba = read_save_state(&slot_path.to_string_lossy().to_string(), game.gba_pc, &game.game_pack);
+                        paused = false;
+                    }
+                }
             }
-
-            if !emulated_this_iteration {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        } else {
-            gba.frame();
-
-            let new_samples = std::mem::take(&mut gba.apu.sample_buffer);
-            let resampled = resampler.process(&new_samples);
-            let device_samples = to_device_channels(&resampled, device_channels);
-            audio_producer.push_slice(&device_samples);
         }
 
-        gba.key_status.set_register(0xFFFF);
+        match current.as_mut() {
+            Some(game) if !paused => {
+                if audio_active && opts.frame_cap.is_none() {
+                    let dt = now.duration_since(last_instant).as_secs_f64();
+                    last_instant = now;
+                    time_accumulator = (time_accumulator + dt).min(GBA_FRAME_SECONDS * MAX_CATCHUP_FRAMES as f64);
 
-        // poll for any gamepad input events
-        while let Some(Event { id, ..}) = gilrs.next_event() {
-            active_gamepad = Some(id);
-        }
+                    let mut emulated_this_iteration = false;
+                    while time_accumulator >= GBA_FRAME_SECONDS {
+                        game.gba.frame();
+                        emulated_this_iteration = true;
+                        time_accumulator -= GBA_FRAME_SECONDS;
 
-        if let Some(gamepad) = active_gamepad.map(|id| gilrs.gamepad(id)) {
-            if gamepad.is_pressed(Button::DPadUp) { gba.key_status.set_dpad_up(0); }
-            if gamepad.is_pressed(Button::DPadDown) { gba.key_status.set_dpad_down(0); }
-            if gamepad.is_pressed(Button::DPadLeft) { gba.key_status.set_dpad_left(0); }
-            if gamepad.is_pressed(Button::DPadRight) { gba.key_status.set_dpad_right(0); }
-            if gamepad.is_pressed(Button::South) { gba.key_status.set_button_a(0); }
-            if gamepad.is_pressed(Button::East) { gba.key_status.set_button_b(0); }
-            if gamepad.is_pressed(Button::RightTrigger) { gba.key_status.set_button_r(0); }
-            if gamepad.is_pressed(Button::LeftTrigger) { gba.key_status.set_button_l(0); }
-            if gamepad.is_pressed(Button::Select) { gba.key_status.set_button_select(0); }
-            if gamepad.is_pressed(Button::Start) { gba.key_status.set_button_start(0); }
-        }
-        
-        window.get_keys().iter().for_each(|key| {
-            match key {
-                Key::W => gba.key_status.set_dpad_up(0),
-                Key::S => gba.key_status.set_dpad_down(0),
-                Key::A => gba.key_status.set_dpad_left(0),
-                Key::D => gba.key_status.set_dpad_right(0),
-                Key::H => gba.key_status.set_button_a(0),
-                Key::J => gba.key_status.set_button_b(0),
-                Key::R => gba.key_status.set_button_r(0),
-                Key::Q => gba.key_status.set_button_l(0),
-                Key::Enter => gba.key_status.set_button_start(0),
-                Key::Backspace => gba.key_status.set_button_select(0),
-                _ => ()
+                        let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
+                        let resampled = resampler.process(&new_samples);
+                        let device_samples = to_device_channels(&resampled, device_channels);
+                        let written = audio_producer.push_slice(&device_samples);
+                        overrun_count += (device_samples.len() - written) as u64;
+                    }
+
+                    if !emulated_this_iteration {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                } else {
+                    game.gba.frame();
+
+                    let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
+                    let resampled = resampler.process(&new_samples);
+                    let device_samples = to_device_channels(&resampled, device_channels);
+                    audio_producer.push_slice(&device_samples);
+                }
+
+                game.gba.key_status.set_register(0xFFFF);
+
+                // poll for any gamepad input events
+                while let Some(Event { id, ..}) = gilrs.next_event() {
+                    active_gamepad = Some(id);
+                }
+
+                if let Some(gamepad) = active_gamepad.map(|id| gilrs.gamepad(id)) {
+                    if gamepad.is_pressed(Button::DPadUp) { game.gba.key_status.set_dpad_up(0); }
+                    if gamepad.is_pressed(Button::DPadDown) { game.gba.key_status.set_dpad_down(0); }
+                    if gamepad.is_pressed(Button::DPadLeft) { game.gba.key_status.set_dpad_left(0); }
+                    if gamepad.is_pressed(Button::DPadRight) { game.gba.key_status.set_dpad_right(0); }
+                    if gamepad.is_pressed(Button::South) { game.gba.key_status.set_button_a(0); }
+                    if gamepad.is_pressed(Button::East) { game.gba.key_status.set_button_b(0); }
+                    if gamepad.is_pressed(Button::RightTrigger) { game.gba.key_status.set_button_r(0); }
+                    if gamepad.is_pressed(Button::LeftTrigger) { game.gba.key_status.set_button_l(0); }
+                    if gamepad.is_pressed(Button::Select) { game.gba.key_status.set_button_select(0); }
+                    if gamepad.is_pressed(Button::Start) { game.gba.key_status.set_button_start(0); }
+                }
+
+                window.get_keys().iter().for_each(|key| {
+                    match key {
+                        Key::W => game.gba.key_status.set_dpad_up(0),
+                        Key::S => game.gba.key_status.set_dpad_down(0),
+                        Key::A => game.gba.key_status.set_dpad_left(0),
+                        Key::D => game.gba.key_status.set_dpad_right(0),
+                        Key::H => game.gba.key_status.set_button_a(0),
+                        Key::J => game.gba.key_status.set_button_b(0),
+                        Key::R => game.gba.key_status.set_button_r(0),
+                        Key::Q => game.gba.key_status.set_button_l(0),
+                        Key::Enter => game.gba.key_status.set_button_start(0),
+                        Key::Backspace => game.gba.key_status.set_button_select(0),
+                        _ => ()
+                    }
+                });
+
+                window
+                    .update_with_buffer(&game.gba.gpu.frame_buffer, WIDTH, HEIGHT)
+                    .unwrap();
+
+                if opts.fps_counter {
+                    fps_counter_buffer.push_back(1f64 / now.elapsed().as_secs_f64());
+                    if fps_counter_buffer.len() == FPS_BUFFER_SIZE {
+                        a = fps_counter_buffer.drain(0..FPS_BUFFER_SIZE).collect();
+                    }
+                    window.set_title(&format!("GBA Emu: {} FPS", a.mean()));
+                }
             }
-        });
-
-        window
-            .update_with_buffer(&gba.gpu.frame_buffer, WIDTH, HEIGHT)
-            .unwrap();
-
-        if opts.fps_counter {
-            fps_counter_buffer.push_back(1f64 / now.elapsed().as_secs_f64());
-            if fps_counter_buffer.len() == FPS_BUFFER_SIZE {
-                a = fps_counter_buffer.drain(0..FPS_BUFFER_SIZE).collect();
+            Some(game) => {
+                window
+                    .update_with_buffer(&game.gba.gpu.frame_buffer, WIDTH, HEIGHT)
+                    .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(16));
             }
-            window.set_title(&format!("GBA Emu: {} FPS", a.mean()));
+            None => {
+                window.update_with_buffer(&blank_buffer, WIDTH, HEIGHT).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
         }
 
         if audio_active && now.duration_since(last_audio_stats_log).as_secs_f64() >= 2.0 {
@@ -700,23 +1045,45 @@ fn main() {
             }
         }
     }
-    
-    if let Some(ref save_path) = opts.save_file {
-        write_save_file(&mut gba, save_path);
-    } else {
-        info!("No save file provided");
-    }
 
-    if let Some(ref save_path) = opts.save_state {
-        write_save_state(&mut gba, save_path);
-    } else {
-        info!("No save state file provided");
+    if let Some(game) = current.as_mut() {
+        write_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_path_for_rom_replaces_extension_with_sav() {
+        let rom = Path::new("C:/roms/Some Game (USA).gba");
+        assert_eq!(save_path_for_rom(rom), PathBuf::from("C:/roms/Some Game (USA).sav"));
+    }
+
+    #[test]
+    fn save_state_path_for_slot_numbers_each_slot() {
+        let rom = Path::new("C:/roms/game.gba");
+        assert_eq!(save_state_path_for_slot(rom, 1), PathBuf::from("C:/roms/game.state1"));
+        assert_eq!(save_state_path_for_slot(rom, 9), PathBuf::from("C:/roms/game.state9"));
+    }
+
+    #[test]
+    fn is_valid_bios_size_accepts_exactly_16kb() {
+        assert!(is_valid_bios_size(16384));
+    }
+
+    #[test]
+    fn is_valid_bios_size_rejects_a_rom_sized_file() {
+        assert!(!is_valid_bios_size(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn is_valid_bios_size_rejects_truncated_or_padded_files() {
+        assert!(!is_valid_bios_size(0));
+        assert!(!is_valid_bios_size(16383));
+        assert!(!is_valid_bios_size(16385));
+    }
 
     #[test]
     fn resampler_passes_through_at_equal_rates() {
