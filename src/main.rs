@@ -1039,15 +1039,6 @@ fn main() {
                 overrun_count = 0;
             }
         }
-
-        if audio_active && now.duration_since(last_audio_stats_log).as_secs_f64() >= 2.0 {
-            last_audio_stats_log = now;
-            let underruns = underrun_count.swap(0, Ordering::Relaxed);
-            if underruns > 0 || overrun_count > 0 {
-                info!("Audio buffer: {} underrun samples, {} overrun samples dropped (last 2s)", underruns, overrun_count);
-                overrun_count = 0;
-            }
-        }
     }
 
     if let Some(game) = current.as_mut() {
@@ -1168,6 +1159,36 @@ mod tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_path_for_rom_replaces_extension_with_sav() {
+        let rom = Path::new("C:/roms/Some Game (USA).gba");
+        assert_eq!(save_path_for_rom(rom), PathBuf::from("C:/roms/Some Game (USA).sav"));
+    }
+
+    #[test]
+    fn save_state_path_for_slot_numbers_each_slot() {
+        let rom = Path::new("C:/roms/game.gba");
+        assert_eq!(save_state_path_for_slot(rom, 1), PathBuf::from("C:/roms/game.state1"));
+        assert_eq!(save_state_path_for_slot(rom, 9), PathBuf::from("C:/roms/game.state9"));
+    }
+
+    #[test]
+    fn is_valid_bios_size_accepts_exactly_16kb() {
+        assert!(is_valid_bios_size(16384));
+    }
+
+    #[test]
+    fn is_valid_bios_size_rejects_a_rom_sized_file() {
+        assert!(!is_valid_bios_size(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn is_valid_bios_size_rejects_truncated_or_padded_files() {
+        assert!(!is_valid_bios_size(0));
+        assert!(!is_valid_bios_size(16383));
+        assert!(!is_valid_bios_size(16385));
+    }
 
     #[test]
     fn resampler_passes_through_at_equal_rates() {
