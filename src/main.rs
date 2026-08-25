@@ -484,12 +484,26 @@ extern "system" {
 }
 
 #[cfg(target_os = "windows")]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(period_ms: u32) -> u32;
+}
+
+#[cfg(target_os = "windows")]
 fn detach_console() {
     unsafe { FreeConsole(); }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn detach_console() {}
+
+#[cfg(target_os = "windows")]
+fn raise_timer_resolution() {
+    unsafe { timeBeginPeriod(1); }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn raise_timer_resolution() {}
 
 fn is_valid_bios_size(byte_len: u64) -> bool {
     byte_len == GBA_BIOS_SIZE
@@ -755,6 +769,7 @@ fn main() {
     }
 
     detach_console();
+    raise_timer_resolution();
 
     let mut window = Window::new(
         "GBA Emulator",
@@ -880,10 +895,13 @@ fn main() {
 
     const GBA_FRAME_SECONDS: f64 = 280896.0 / 16777216.0;
     const MAX_CATCHUP_FRAMES: u32 = 30;
+    const TURBO_MULTIPLIER: f64 = 4.0;
+    const SLEEP_SAFETY_MARGIN_SECONDS: f64 = 0.002;
 
     let mut time_accumulator = 0.0f64;
     let mut last_instant = Instant::now();
     let mut last_audio_stats_log = Instant::now();
+    let mut last_turbo = false;
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !should_exit {
         let now = Instant::now();
@@ -944,36 +962,59 @@ fn main() {
             }
         }
 
+        let turbo = window.is_key_down(Key::Space)
+            || active_gamepad.map(|id| gilrs.gamepad(id).is_pressed(Button::Select)).unwrap_or(false);
+        if turbo != last_turbo && !opts.fps_counter {
+            window.set_title(if turbo { "GBA Emulator (Turbo)" } else { "GBA Emulator" });
+        }
+        last_turbo = turbo;
+
+        let mut frames_emulated: u32 = 0;
+
         match current.as_mut() {
             Some(game) if !paused => {
                 if audio_active && opts.frame_cap.is_none() {
-                    let dt = now.duration_since(last_instant).as_secs_f64();
+                    let mut dt = now.duration_since(last_instant).as_secs_f64();
                     last_instant = now;
+                    if turbo {
+                        dt *= TURBO_MULTIPLIER;
+                    }
                     time_accumulator = (time_accumulator + dt).min(GBA_FRAME_SECONDS * MAX_CATCHUP_FRAMES as f64);
 
-                    let mut emulated_this_iteration = false;
                     while time_accumulator >= GBA_FRAME_SECONDS {
                         game.gba.frame();
-                        emulated_this_iteration = true;
+                        frames_emulated += 1;
                         time_accumulator -= GBA_FRAME_SECONDS;
 
                         let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
-                        let resampled = resampler.process(&new_samples);
-                        let device_samples = to_device_channels(&resampled, device_channels);
-                        let written = audio_producer.push_slice(&device_samples);
-                        overrun_count += (device_samples.len() - written) as u64;
+                        if !turbo {
+                            let resampled = resampler.process(&new_samples);
+                            let device_samples = to_device_channels(&resampled, device_channels);
+                            let written = audio_producer.push_slice(&device_samples);
+                            overrun_count += (device_samples.len() - written) as u64;
+                        }
                     }
 
-                    if !emulated_this_iteration {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    if !turbo {
+                        let remaining = GBA_FRAME_SECONDS - time_accumulator;
+                        let sleep_secs = (remaining - SLEEP_SAFETY_MARGIN_SECONDS).max(0.0);
+                        if sleep_secs > 0.0 {
+                            std::thread::sleep(std::time::Duration::from_secs_f64(sleep_secs));
+                        }
                     }
                 } else {
-                    game.gba.frame();
+                    let frames_this_iteration = if turbo { TURBO_MULTIPLIER as usize } else { 1 };
+                    for _ in 0..frames_this_iteration {
+                        game.gba.frame();
+                        frames_emulated += 1;
 
-                    let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
-                    let resampled = resampler.process(&new_samples);
-                    let device_samples = to_device_channels(&resampled, device_channels);
-                    audio_producer.push_slice(&device_samples);
+                        let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
+                        if !turbo {
+                            let resampled = resampler.process(&new_samples);
+                            let device_samples = to_device_channels(&resampled, device_channels);
+                            audio_producer.push_slice(&device_samples);
+                        }
+                    }
                 }
 
                 game.gba.key_status.set_register(0xFFFF);
@@ -1016,7 +1057,7 @@ fn main() {
                     .update_with_buffer(&game.gba.gpu.frame_buffer, WIDTH, HEIGHT)
                     .unwrap();
 
-                if opts.fps_counter {
+                if opts.fps_counter && frames_emulated > 0 {
                     fps_counter_buffer.push_back(1f64 / now.elapsed().as_secs_f64());
                     if fps_counter_buffer.len() == FPS_BUFFER_SIZE {
                         a = fps_counter_buffer.drain(0..FPS_BUFFER_SIZE).collect();
