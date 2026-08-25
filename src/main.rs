@@ -59,8 +59,6 @@ pub fn init_logger() -> Result<(), SetLoggerError> {
     log::set_logger(&LOGGER)?;
     log::set_max_level(Level::Trace.to_level_filter());
 
-    // Truncates any log file from a previous run, so each run starts fresh
-    // and can be reviewed on its own between sessions.
     match File::create(LOG_FILE_PATH) {
         Ok(file) => {
             if let Ok(mut guard) = LOG_FILE.lock() {
@@ -81,45 +79,26 @@ struct Opts {
     bios_file: Option<String>,
     rom_file: Option<String>,
     save_file: Option<String>,
-    /// Skip the BIOS boot animation and start execution at the ROM entry point.
     #[arg(short = 'b', long)]
     skip_bios: bool,
-    /// Cap emulation to this many frames per second.
     #[arg(short = 'c', long)]
     frame_cap: Option<usize>,
-    /// Print an FPS counter to the log.
     #[arg(short = 'f', long)]
     fps_counter: bool,
-    /// Resume from a save state file instead of a cold boot.
     #[arg(short = 's', long)]
     save_state: Option<String>,
-    /// Run headlessly (no window) for this many frames, dump the final
-    /// framebuffer to --dump-bmp, then exit. For scripted test-ROM runs.
     #[arg(long)]
     headless_frames: Option<usize>,
-    /// Output path for the --headless-frames framebuffer dump (24bpp BMP).
     #[arg(long)]
     dump_bmp: Option<String>,
-    /// Output path for the --headless-frames audio dump (16-bit PCM WAV,
-    /// at the Apu's fixed internal sample rate).
     #[arg(long)]
     dump_wav: Option<String>,
-    /// Scripted input for --headless-frames: "frame:button,frame:button,...".
-    /// Each button is pressed for exactly one frame at the given frame
-    /// index (0-based), then released. Button names: up/down/left/right/
-    /// a/b/l/r/start/select. Example: "60:start,120:down,126:a".
     #[arg(long)]
     headless_input: Option<String>,
-    /// Write a save state to this path after --headless-frames finishes
-    /// (separate from --save-state, which is only ever read from — this
-    /// lets a headless run checkpoint progress without overwriting the
-    /// state it resumed from).
     #[arg(long)]
     dump_save_state: Option<String>
 }
 
-/// Applies one button (named as in --headless-input) to a KeyStatus for
-/// exactly the current frame.
 fn press_button(key_status: &mut gba_emulator::memory::key_input_registers::KeyStatus, name: &str) {
     match name {
         "up" => key_status.set_dpad_up(0),
@@ -136,8 +115,6 @@ fn press_button(key_status: &mut gba_emulator::memory::key_input_registers::KeyS
     }
 }
 
-/// Parses "frame:button,frame:button,..." into a lookup from frame index to
-/// the list of buttons pressed on exactly that frame.
 fn parse_headless_input(spec: &str) -> std::collections::HashMap<usize, Vec<String>> {
     let mut schedule: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
     for entry in spec.split(',') {
@@ -157,9 +134,6 @@ fn parse_headless_input(spec: &str) -> std::collections::HashMap<usize, Vec<Stri
     schedule
 }
 
-/// Writes interleaved-stereo i16 PCM samples as a 16-bit PCM WAV file.
-/// Used by --headless-frames to inspect audio output without needing a
-/// live audio device — the audio counterpart to --dump-bmp.
 fn write_wav(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Result<()> {
     const CHANNELS: u16 = 2;
     const BITS_PER_SAMPLE: u16 = 16;
@@ -174,7 +148,7 @@ fn write_wav(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Result<(
 
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&1u16.to_le_bytes());
     buf.extend_from_slice(&CHANNELS.to_le_bytes());
     buf.extend_from_slice(&sample_rate.to_le_bytes());
     buf.extend_from_slice(&byte_rate.to_le_bytes());
@@ -190,9 +164,6 @@ fn write_wav(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Result<(
     std::fs::write(path, buf)
 }
 
-/// Writes an uncompressed 24bpp BMP from a 0RGB framebuffer (as produced by
-/// gpu::frame_buffer). Used by --headless-frames to let a screenshot of a
-/// test ROM's result screen be inspected without needing a live window.
 fn write_bmp(path: &str, frame_buffer: &[u32], width: usize, height: usize) -> std::io::Result<()> {
     let row_size = width * 3;
     let pixel_data_size = row_size * height;
@@ -215,7 +186,6 @@ fn write_bmp(path: &str, frame_buffer: &[u32], width: usize, height: usize) -> s
     buf.extend_from_slice(&0u32.to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes());
 
-    // BMP rows are stored bottom-up.
     for y in (0..height).rev() {
         for x in 0..width {
             let pixel = frame_buffer[y * width + x];
@@ -281,8 +251,6 @@ fn write_save_file(gba: &mut GBA, save_path: &String) {
     }
 }
 
-// Linear-interpolation resampler from the Apu's fixed 32768 Hz to the device's rate.
-// Carries the last frame across calls so consecutive batches interpolate smoothly.
 struct Resampler {
     input_rate: f64,
     output_rate: f64,
@@ -302,7 +270,6 @@ impl Resampler {
         }
     }
 
-    // `input`/return value are interleaved stereo (L, R, L, R, ...).
     fn process(&mut self, input: &[i16]) -> Vec<i16> {
         let frame_count = input.len() / 2;
         if frame_count == 0 {
@@ -358,8 +325,6 @@ fn query_audio_output_config() -> Option<(cpal::Device, cpal::SupportedStreamCon
     }
 }
 
-// `consumer` is the read half of a lock-free SPSC ring buffer, filled with a
-// startup cushion by the caller before this is invoked (main's warm-up loop).
 fn build_and_start_audio_stream(
     device: cpal::Device,
     config: cpal::SupportedStreamConfig,
@@ -369,7 +334,6 @@ fn build_and_start_audio_stream(
     let sample_format = config.sample_format();
     let buffer_size_range = config.buffer_size().clone();
     let mut stream_config: cpal::StreamConfig = config.into();
-    // Larger fixed buffer: HDMI/DisplayPort-routed audio devices are glitch-prone with WASAPI's default size.
     if let cpal::SupportedBufferSize::Range { min, max } = buffer_size_range {
         let desired = 4096u32.clamp(min, max);
         stream_config.buffer_size = cpal::BufferSize::Fixed(desired);
@@ -430,8 +394,6 @@ fn build_and_start_audio_stream(
     }
 }
 
-// On underrun, holding the last sample (decaying toward silence) avoids the
-// audible click a hard drop to zero would cause mid-waveform.
 const UNDERRUN_DECAY: f32 = 0.995;
 
 fn fill_audio_buffer<S: Copy>(
@@ -863,7 +825,6 @@ fn main() {
     let ring = HeapRb::<i16>::new(max_buffered_samples);
     let (mut audio_producer, audio_consumer) = ring.split();
 
-    // Pre-fill a ~200ms cushion before starting playback to absorb early jitter.
     let warmup_target_samples = (device_sample_rate as usize) * (device_channels as usize) / 5;
     if let Some(game) = current.as_mut() {
         while audio_producer.len() < warmup_target_samples {
@@ -878,17 +839,11 @@ fn main() {
     let underrun_count = Arc::new(AtomicU64::new(0));
     let mut overrun_count: u64 = 0;
 
-    // Dropping the Stream stops playback; None means no device or one failed to open.
     let _audio_stream = audio_config.and_then(|(device, config)| {
         build_and_start_audio_stream(device, config, audio_consumer, underrun_count.clone())
     });
     let audio_active = _audio_stream.is_some();
 
-    // Pace emulation off real elapsed wall-clock time rather than a fixed
-    // FPS target: a fixed 60fps loop can't see that a window's own
-    // present/vsync cost varies (e.g. by focus state), so it silently
-    // drifts from real-time and starves the audio buffer. `--frame_cap`
-    // or no audio device falls back to fixed-FPS pacing.
     if !audio_active {
         window.set_target_fps(opts.frame_cap.unwrap_or(60));
     }
@@ -1019,7 +974,6 @@ fn main() {
 
                 game.gba.key_status.set_register(0xFFFF);
 
-                // poll for any gamepad input events
                 while let Some(Event { id, ..}) = gilrs.next_event() {
                     active_gamepad = Some(id);
                 }
