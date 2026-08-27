@@ -8,13 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use log::{Level, Metadata, Record, SetLoggerError, error, info};
 use std::{collections::VecDeque, time::Instant};
 use std::path::{Path, PathBuf};
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, Window, WindowOptions, KeyRepeat, MouseButton, MouseMode};
 use average::Mean;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{HeapRb, HeapConsumer};
-use muda::{Menu, Submenu, MenuItem, MenuEvent, PredefinedMenuItem, IsMenuItem};
+use muda::{Menu, Submenu, MenuItem, CheckMenuItem, MenuEvent, PredefinedMenuItem, IsMenuItem};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+mod debug_ui;
+use debug_ui::DebuggerState;
 
 
 const WIDTH: usize = 240;
@@ -547,6 +550,10 @@ struct AppMenu {
     save_menu: Submenu,
     #[allow(dead_code)]
     settings_menu: Submenu,
+    debug: CheckMenuItem,
+    debug_step: MenuItem,
+    debug_continue: MenuItem,
+    debug_clear_breakpoints: MenuItem,
 }
 
 impl AppMenu {
@@ -565,7 +572,7 @@ impl AppMenu {
     }
 }
 
-fn build_menu(window: &Window) -> AppMenu {
+fn build_menu(window: &Window, debugger_enabled: bool) -> AppMenu {
     let menu = Menu::new();
 
     let open_rom = MenuItem::new("Open ROM...", true, None);
@@ -622,10 +629,28 @@ fn build_menu(window: &Window) -> AppMenu {
 
     let settings_menu = Submenu::new("Settings", true);
 
+    let debug = CheckMenuItem::new("Show Debugger", true, debugger_enabled, None);
+    let debug_step = MenuItem::new("Step Instruction (F10)", true, None);
+    let debug_continue = MenuItem::new("Continue (F5)", true, None);
+    let debug_clear_breakpoints = MenuItem::new("Clear Breakpoints", true, None);
+    let debug_menu = Submenu::with_items(
+        "Debug",
+        true,
+        &[
+            &debug,
+            &PredefinedMenuItem::separator(),
+            &debug_step,
+            &debug_continue,
+            &debug_clear_breakpoints,
+        ],
+    )
+    .expect("failed to build Debug menu");
+
     menu.append(&file_menu).expect("failed to append File menu");
     menu.append(&emulation_menu).expect("failed to append Emulation menu");
     menu.append(&save_menu).expect("failed to append Save menu");
     menu.append(&settings_menu).expect("failed to append Settings menu");
+    menu.append(&debug_menu).expect("failed to append Debug menu");
 
     #[cfg(target_os = "windows")]
     {
@@ -651,9 +676,73 @@ fn build_menu(window: &Window) -> AppMenu {
         emulation_menu,
         save_menu,
         settings_menu,
+        debug,
+        debug_step,
+        debug_continue,
+        debug_clear_breakpoints,
     };
     app_menu.set_game_loaded(false);
     app_menu
+}
+
+fn recreate_window(old: &Window, debugger_shown: bool, opts: &Opts, audio_active: bool) -> (Window, AppMenu) {
+    let position = old.get_position();
+    let title = if debugger_shown { "GBA Emulator (Debug)" } else { "GBA Emulator" };
+
+    let (width, height, scale) = if debugger_shown {
+        (debug_ui::TOTAL_WIDTH, debug_ui::TOTAL_HEIGHT, debug_ui::SCALE)
+    } else {
+        (WIDTH, HEIGHT, minifb::Scale::X8)
+    };
+
+    let mut new_window = Window::new(
+        title,
+        width,
+        height,
+        WindowOptions {
+            resize: true,
+            scale,
+            ..WindowOptions::default()
+        },
+    )
+    .unwrap_or_else(|e| {
+        panic!("{}", e);
+    });
+
+    new_window.set_position(position.0, position.1);
+    if !audio_active {
+        new_window.set_target_fps(opts.frame_cap.unwrap_or(60));
+    }
+
+    let new_menu = build_menu(&new_window, debugger_shown);
+    (new_window, new_menu)
+}
+
+const MAX_STEPS_PER_SLICE: u32 = 300_000;
+
+fn emulate_frame(gba: &mut GBA, debugger_state: &DebuggerState) -> bool {
+    if debugger_state.enabled && !debugger_state.breakpoints.is_empty() {
+        gba.frame_until_breakpoint(&debugger_state.breakpoints, MAX_STEPS_PER_SLICE)
+    } else {
+        gba.frame();
+        true
+    }
+}
+
+fn present(window: &mut Window, debugger_state: &DebuggerState, debug_buf: &mut [u32], game_buf: &[u32], gba: Option<&GBA>) {
+    if debugger_state.enabled {
+        debug_ui::render(debug_buf, debug_ui::TOTAL_WIDTH, debugger_state, gba);
+        for row in 0..HEIGHT {
+            let src = row * WIDTH;
+            let dst = row * debug_ui::TOTAL_WIDTH;
+            debug_buf[dst..dst + WIDTH].copy_from_slice(&game_buf[src..src + WIDTH]);
+        }
+        window
+            .update_with_buffer(debug_buf, debug_ui::TOTAL_WIDTH, debug_ui::TOTAL_HEIGHT)
+            .unwrap();
+    } else {
+        window.update_with_buffer(game_buf, WIDTH, HEIGHT).unwrap();
+    }
 }
 
 fn main() {
@@ -665,6 +754,10 @@ fn main() {
             info!("Logger failed to initialize");
         }
     }
+
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("PANIC: {}", info);
+    }));
 
     let opts: Opts = Opts::parse();
     let mut gilrs = Gilrs::new().unwrap();
@@ -747,7 +840,7 @@ fn main() {
         panic!("{}", e);
     });
 
-    let app_menu = build_menu(&window);
+    let mut app_menu = build_menu(&window, false);
     let local_bios_path = find_local_bios();
     app_menu.open_rom.set_enabled(local_bios_path.is_some());
     if local_bios_path.is_none() {
@@ -771,6 +864,8 @@ fn main() {
     let blank_buffer = vec![0u32; WIDTH * HEIGHT];
     let mut paused = false;
     let mut should_exit = false;
+    let mut debugger_state = DebuggerState::default();
+    let mut debug_buf = vec![0u32; debug_ui::TOTAL_WIDTH * debug_ui::TOTAL_HEIGHT];
 
     let mut current: Option<RunningGame> = if let (Some(bios_file), Some(rom_file)) =
         (opts.bios_file.clone(), opts.rom_file.clone())
@@ -857,6 +952,7 @@ fn main() {
     let mut last_instant = Instant::now();
     let mut last_audio_stats_log = Instant::now();
     let mut last_turbo = false;
+    let mut last_mouse_down = false;
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !should_exit {
         let now = Instant::now();
@@ -914,6 +1010,30 @@ fn main() {
                         paused = false;
                     }
                 }
+            } else if event.id == app_menu.debug.id() {
+                debugger_state.enabled = !debugger_state.enabled;
+                let (new_window, new_menu) = recreate_window(&window, debugger_state.enabled, &opts, audio_active);
+                window = new_window;
+                app_menu = new_menu;
+                app_menu.set_game_loaded(current.is_some());
+                app_menu.refresh_state_slots(current.as_ref().map(|g| g.rom_path.as_path()));
+                if paused {
+                    let _ = app_menu.pause.set_text("Resume");
+                }
+            } else if event.id == app_menu.debug_step.id() {
+                if debugger_state.enabled {
+                    if let Some(game) = current.as_mut() {
+                        game.gba.single_step();
+                        let _ = std::mem::take(&mut game.gba.apu.sample_buffer);
+                        paused = true;
+                        let _ = app_menu.pause.set_text("Resume");
+                    }
+                }
+            } else if event.id == app_menu.debug_continue.id() {
+                paused = false;
+                let _ = app_menu.pause.set_text("Pause");
+            } else if event.id == app_menu.debug_clear_breakpoints.id() {
+                debugger_state.breakpoints.clear();
             }
         }
 
@@ -923,6 +1043,65 @@ fn main() {
             window.set_title(if turbo { "GBA Emulator (Turbo)" } else { "GBA Emulator" });
         }
         last_turbo = turbo;
+
+        if debugger_state.enabled {
+            if window.is_key_pressed(Key::F10, KeyRepeat::No) {
+                if let Some(game) = current.as_mut() {
+                    game.gba.single_step();
+                    let _ = std::mem::take(&mut game.gba.apu.sample_buffer);
+                    paused = true;
+                    let _ = app_menu.pause.set_text("Resume");
+                }
+            }
+            if window.is_key_pressed(Key::F5, KeyRepeat::No) {
+                paused = false;
+                let _ = app_menu.pause.set_text("Pause");
+            }
+            if window.is_key_pressed(Key::F9, KeyRepeat::No) {
+                if let Some(game) = current.as_ref() {
+                    let pc = game.gba.cpu.get_pc();
+                    if !debugger_state.breakpoints.remove(&pc) {
+                        debugger_state.breakpoints.insert(pc);
+                    }
+                }
+            }
+
+            if window.is_key_pressed(Key::LeftBracket, KeyRepeat::No) {
+                debugger_state.memory_region = (debugger_state.memory_region + debug_ui::panels::memory::REGIONS.len() - 1) % debug_ui::panels::memory::REGIONS.len();
+                debugger_state.memory_base = debug_ui::panels::memory::REGIONS[debugger_state.memory_region].1;
+            }
+            if window.is_key_pressed(Key::RightBracket, KeyRepeat::No) {
+                debugger_state.memory_region = (debugger_state.memory_region + 1) % debug_ui::panels::memory::REGIONS.len();
+                debugger_state.memory_base = debug_ui::panels::memory::REGIONS[debugger_state.memory_region].1;
+            }
+            if window.is_key_pressed(Key::Up, KeyRepeat::Yes) {
+                debugger_state.memory_base = debugger_state.memory_base.wrapping_sub(debug_ui::panels::memory::ROW_BYTES);
+            }
+            if window.is_key_pressed(Key::Down, KeyRepeat::Yes) {
+                debugger_state.memory_base = debugger_state.memory_base.wrapping_add(debug_ui::panels::memory::ROW_BYTES);
+            }
+            if window.is_key_pressed(Key::PageUp, KeyRepeat::Yes) {
+                debugger_state.memory_base = debugger_state.memory_base.wrapping_sub(debug_ui::panels::memory::ROW_BYTES * debug_ui::panels::memory::VISIBLE_ROWS);
+            }
+            if window.is_key_pressed(Key::PageDown, KeyRepeat::Yes) {
+                debugger_state.memory_base = debugger_state.memory_base.wrapping_add(debug_ui::panels::memory::ROW_BYTES * debug_ui::panels::memory::VISIBLE_ROWS);
+            }
+
+            let mouse_down = window.get_mouse_down(MouseButton::Left);
+            let mouse_clicked = mouse_down && !last_mouse_down;
+            last_mouse_down = mouse_down;
+            if mouse_clicked {
+                if let Some(game) = current.as_ref() {
+                    if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+                        if let Some(addr) = debug_ui::panels::disassembly::address_for_click(&debug_ui::DISASM_PANEL, &game.gba, mx, my) {
+                            if !debugger_state.breakpoints.remove(&addr) {
+                                debugger_state.breakpoints.insert(addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let mut frames_emulated: u32 = 0;
 
@@ -937,7 +1116,7 @@ fn main() {
                     time_accumulator = (time_accumulator + dt).min(GBA_FRAME_SECONDS * MAX_CATCHUP_FRAMES as f64);
 
                     while time_accumulator >= GBA_FRAME_SECONDS {
-                        game.gba.frame();
+                        let completed = emulate_frame(&mut game.gba, &debugger_state);
                         frames_emulated += 1;
                         time_accumulator -= GBA_FRAME_SECONDS;
 
@@ -947,6 +1126,12 @@ fn main() {
                             let device_samples = to_device_channels(&resampled, device_channels);
                             let written = audio_producer.push_slice(&device_samples);
                             overrun_count += (device_samples.len() - written) as u64;
+                        }
+
+                        if !completed {
+                            paused = true;
+                            let _ = app_menu.pause.set_text("Resume");
+                            break;
                         }
                     }
 
@@ -960,7 +1145,7 @@ fn main() {
                 } else {
                     let frames_this_iteration = if turbo { TURBO_MULTIPLIER as usize } else { 1 };
                     for _ in 0..frames_this_iteration {
-                        game.gba.frame();
+                        let completed = emulate_frame(&mut game.gba, &debugger_state);
                         frames_emulated += 1;
 
                         let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
@@ -968,6 +1153,12 @@ fn main() {
                             let resampled = resampler.process(&new_samples);
                             let device_samples = to_device_channels(&resampled, device_channels);
                             audio_producer.push_slice(&device_samples);
+                        }
+
+                        if !completed {
+                            paused = true;
+                            let _ = app_menu.pause.set_text("Resume");
+                            break;
                         }
                     }
                 }
@@ -1007,9 +1198,7 @@ fn main() {
                     }
                 });
 
-                window
-                    .update_with_buffer(&game.gba.gpu.frame_buffer, WIDTH, HEIGHT)
-                    .unwrap();
+                present(&mut window, &debugger_state, &mut debug_buf, &game.gba.gpu.frame_buffer, Some(&game.gba));
 
                 if opts.fps_counter && frames_emulated > 0 {
                     fps_counter_buffer.push_back(1f64 / now.elapsed().as_secs_f64());
@@ -1020,13 +1209,11 @@ fn main() {
                 }
             }
             Some(game) => {
-                window
-                    .update_with_buffer(&game.gba.gpu.frame_buffer, WIDTH, HEIGHT)
-                    .unwrap();
+                present(&mut window, &debugger_state, &mut debug_buf, &game.gba.gpu.frame_buffer, Some(&game.gba));
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
             None => {
-                window.update_with_buffer(&blank_buffer, WIDTH, HEIGHT).unwrap();
+                present(&mut window, &debugger_state, &mut debug_buf, &blank_buffer, None);
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
         }
