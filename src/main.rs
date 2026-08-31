@@ -796,7 +796,7 @@ fn main() {
 
         let input_schedule = opts.headless_input.as_deref().map(parse_headless_input).unwrap_or_default();
         for frame_index in 0..frame_count {
-            gba.key_status.set_register(0xFFFF);
+            gba.key_status.set_register(0x03FF);
             if let Some(buttons) = input_schedule.get(&frame_index) {
                 for button in buttons {
                     press_button(&mut gba.key_status, button);
@@ -1163,7 +1163,7 @@ fn main() {
                     }
                 }
 
-                game.gba.key_status.set_register(0xFFFF);
+                game.gba.key_status.set_register(0x03FF);
 
                 while let Some(Event { id, ..}) = gilrs.next_event() {
                     active_gamepad = Some(id);
