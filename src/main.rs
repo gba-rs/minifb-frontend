@@ -509,6 +509,7 @@ struct RunningGame {
 
 fn open_rom(bios_path: &str, rom_path: &Path, skip_bios: bool) -> Option<RunningGame> {
     let rom_path_string = rom_path.to_string_lossy().to_string();
+    let t0 = Instant::now();
     let game_pack = match GamePack::load(bios_path, &rom_path_string) {
         Ok(pack) => pack,
         Err(e) => {
@@ -516,16 +517,21 @@ fn open_rom(bios_path: &str, rom_path: &Path, skip_bios: bool) -> Option<Running
             return None;
         }
     };
+    info!("[timing] GamePack::load: {:?}", t0.elapsed());
 
     let gba_pc = if skip_bios { 0x08000000 } else { 0x0 };
+    let t1 = Instant::now();
     let mut gba = GBA::new(gba_pc, &game_pack);
+    info!("[timing] GBA::new: {:?}", t1.elapsed());
 
+    let t2 = Instant::now();
     let save_path = save_path_for_rom(rom_path);
     if save_path.exists() {
         read_save_file(&mut gba, &save_path.to_string_lossy().to_string());
     } else {
         info!("No existing save file for {}", rom_path.display());
     }
+    info!("[timing] save file check/read: {:?}", t2.elapsed());
 
     Some(RunningGame {
         gba,
@@ -960,11 +966,17 @@ fn main() {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == app_menu.open_rom.id() {
                 if let Some(bios_path) = &local_bios_path {
+                    let dialog_start = Instant::now();
                     if let Some(rom_path) = rfd::FileDialog::new().add_filter("GBA ROM", &["gba"]).set_parent(&window).pick_file() {
+                        info!("[timing] file dialog: {:?}", dialog_start.elapsed());
+                        let save_start = Instant::now();
                         if let Some(mut game) = current.take() {
                             write_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
                         }
+                        info!("[timing] write previous save: {:?}", save_start.elapsed());
+                        let open_start = Instant::now();
                         if let Some(new_game) = open_rom(&bios_path.to_string_lossy(), &rom_path, opts.skip_bios) {
+                            info!("[timing] open_rom total: {:?}", open_start.elapsed());
                             app_menu.refresh_state_slots(Some(&new_game.rom_path));
                             app_menu.set_game_loaded(true);
                             paused = false;
