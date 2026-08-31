@@ -960,7 +960,7 @@ fn main() {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == app_menu.open_rom.id() {
                 if let Some(bios_path) = &local_bios_path {
-                    if let Some(rom_path) = rfd::FileDialog::new().add_filter("GBA ROM", &["gba"]).pick_file() {
+                    if let Some(rom_path) = rfd::FileDialog::new().add_filter("GBA ROM", &["gba"]).set_parent(&window).pick_file() {
                         if let Some(mut game) = current.take() {
                             write_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
                         }
@@ -991,7 +991,7 @@ fn main() {
                 }
             } else if event.id == app_menu.select_save_file.id() {
                 if let Some(game) = current.as_mut() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("GBA save file", &["sav"]).pick_file() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("GBA save file", &["sav"]).set_parent(&window).pick_file() {
                         game.save_path = path;
                         read_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
                     }
