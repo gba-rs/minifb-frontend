@@ -99,7 +99,9 @@ struct Opts {
     #[arg(long)]
     headless_input: Option<String>,
     #[arg(long)]
-    dump_save_state: Option<String>
+    dump_save_state: Option<String>,
+    #[arg(long)]
+    dump_debug_bmp: Option<String>
 }
 
 fn press_button(key_status: &mut gba_emulator::memory::key_input_registers::KeyStatus, name: &str) {
@@ -801,6 +803,8 @@ fn main() {
         }
 
         let input_schedule = opts.headless_input.as_deref().map(parse_headless_input).unwrap_or_default();
+        let mut all_samples: Vec<i16> = Vec::new();
+        let mut last_frame_samples: Vec<i16> = Vec::new();
         for frame_index in 0..frame_count {
             gba.key_status.set_register(0x03FF);
             if let Some(buttons) = input_schedule.get(&frame_index) {
@@ -809,6 +813,8 @@ fn main() {
                 }
             }
             gba.frame();
+            last_frame_samples = std::mem::take(&mut gba.apu.sample_buffer);
+            all_samples.extend_from_slice(&last_frame_samples);
         }
         if let Some(ref dump_path) = opts.dump_bmp {
             match write_bmp(dump_path, &gba.gpu.frame_buffer, WIDTH, HEIGHT) {
@@ -816,8 +822,24 @@ fn main() {
                 Err(e) => error!("Failed to write BMP dump: {}", e),
             }
         }
+        if let Some(ref dump_path) = opts.dump_debug_bmp {
+            let mut debugger_state = DebuggerState::default();
+            debugger_state.enabled = true;
+            debugger_state.recent_audio_samples = last_frame_samples;
+            let mut debug_buf = vec![0u32; debug_ui::TOTAL_WIDTH * debug_ui::TOTAL_HEIGHT];
+            debug_ui::render(&mut debug_buf, debug_ui::TOTAL_WIDTH, &debugger_state, Some(&gba));
+            for row in 0..HEIGHT {
+                let src = row * WIDTH;
+                let dst = row * debug_ui::TOTAL_WIDTH;
+                debug_buf[dst..dst + WIDTH].copy_from_slice(&gba.gpu.frame_buffer[src..src + WIDTH]);
+            }
+            match write_bmp(dump_path, &debug_buf, debug_ui::TOTAL_WIDTH, debug_ui::TOTAL_HEIGHT) {
+                Ok(_) => info!("Wrote headless debug UI dump to {}", dump_path),
+                Err(e) => error!("Failed to write debug BMP dump: {}", e),
+            }
+        }
         if let Some(ref dump_path) = opts.dump_wav {
-            match write_wav(dump_path, &gba.apu.sample_buffer, gba_emulator::apu::OUTPUT_SAMPLE_RATE as u32) {
+            match write_wav(dump_path, &all_samples, gba_emulator::apu::OUTPUT_SAMPLE_RATE as u32) {
                 Ok(_) => info!("Wrote headless audio dump to {}", dump_path),
                 Err(e) => error!("Failed to write WAV dump: {}", e),
             }
@@ -1133,6 +1155,9 @@ fn main() {
                         time_accumulator -= GBA_FRAME_SECONDS;
 
                         let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
+                        if debugger_state.enabled {
+                            debugger_state.recent_audio_samples = new_samples.clone();
+                        }
                         if !turbo {
                             let resampled = resampler.process(&new_samples);
                             let device_samples = to_device_channels(&resampled, device_channels);
@@ -1161,6 +1186,9 @@ fn main() {
                         frames_emulated += 1;
 
                         let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
+                        if debugger_state.enabled {
+                            debugger_state.recent_audio_samples = new_samples.clone();
+                        }
                         if !turbo {
                             let resampled = resampler.process(&new_samples);
                             let device_samples = to_device_channels(&resampled, device_channels);
