@@ -24,6 +24,14 @@ const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
 const FPS_BUFFER_SIZE: usize = 30;
 const LOG_FILE_PATH: &str = "gba_emulator.log";
+const GBA_FRAME_SECONDS: f64 = 280896.0 / 16777216.0;
+
+fn frame_sleep_seconds(accumulator: f64, iteration_elapsed: f64) -> f64 {
+    // The accumulator was sampled at the start of the iteration. Emulation,
+    // input and presentation have already used part of the next frame's budget.
+    const SAFETY_MARGIN: f64 = 0.002;
+    (GBA_FRAME_SECONDS - accumulator - iteration_elapsed - SAFETY_MARGIN).max(0.0)
+}
 
 pub struct ConsoleLogger;
 
@@ -38,13 +46,9 @@ impl log::Log for ConsoleLogger {
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
 
-            let target = if record.target().len() > 0 {
-                record.target()
-            } else {
-                record.module_path().unwrap_or_default()
-            };
-
-            println!("{}", record.args());
+            // The GUI detaches its console. A closed stdout must not panic
+            // inside the logger (or recursively inside the panic hook).
+            let _ = writeln!(std::io::stdout(), "{}", record.args());
 
             if let Ok(mut guard) = LOG_FILE.lock() {
                 if let Some(file) = guard.as_mut() {
@@ -240,7 +244,7 @@ fn read_save_state(save_path: &String, gba_pc: u32, game_pack: &GamePack) -> GBA
 }
 
 fn write_save_state(gba: &mut GBA, save_path: &String) {
-    if let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(&save_path) {
+    if let Ok(mut file) = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&save_path) {
         let binary = bincode::serialize(&gba).unwrap();
         let _ = file.write_all(&binary);
     } else {
@@ -249,7 +253,7 @@ fn write_save_state(gba: &mut GBA, save_path: &String) {
 }
 
 fn write_save_file(gba: &mut GBA, save_path: &String) {
-    if let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(&save_path) {
+    if let Ok(mut file) = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&save_path) {
         let _ = file.write_all(&gba.get_save_data()[..]);
     } else {
         error!("Failed to open {}", &save_path);
@@ -345,35 +349,37 @@ fn build_and_start_audio_stream(
         info!("Requesting fixed audio buffer size of {} frames (device range {}-{})", desired, min, max);
     }
 
+    let channels = stream_config.channels as usize;
+    let rebuffer_samples = stream_config.sample_rate.0 as usize * channels / 10;
     let err_fn = |e| error!("Audio stream error: {}", e);
 
     let stream_result = match sample_format {
         cpal::SampleFormat::I16 => {
-            let mut last_sample = 0i16;
+            let mut playback = AudioPlayback::new(channels, rebuffer_samples);
             let underruns = underrun_count.clone();
             device.build_output_stream(
                 &stream_config,
-                move |data: &mut [i16], _| fill_audio_buffer(data, &mut consumer, &mut last_sample, &underruns, |s| s),
+                move |data: &mut [i16], _| fill_audio_buffer(data, &mut consumer, &mut playback, &underruns, |s| s),
                 err_fn,
                 None,
             )
         },
         cpal::SampleFormat::U16 => {
-            let mut last_sample = 0i16;
+            let mut playback = AudioPlayback::new(channels, rebuffer_samples);
             let underruns = underrun_count.clone();
             device.build_output_stream(
                 &stream_config,
-                move |data: &mut [u16], _| fill_audio_buffer(data, &mut consumer, &mut last_sample, &underruns, |s| (s as i32 + 32768) as u16),
+                move |data: &mut [u16], _| fill_audio_buffer(data, &mut consumer, &mut playback, &underruns, |s| (s as i32 + 32768) as u16),
                 err_fn,
                 None,
             )
         },
         cpal::SampleFormat::F32 => {
-            let mut last_sample = 0i16;
+            let mut playback = AudioPlayback::new(channels, rebuffer_samples);
             let underruns = underrun_count.clone();
             device.build_output_stream(
                 &stream_config,
-                move |data: &mut [f32], _| fill_audio_buffer(data, &mut consumer, &mut last_sample, &underruns, |s| s as f32 / 32768.0),
+                move |data: &mut [f32], _| fill_audio_buffer(data, &mut consumer, &mut playback, &underruns, |s| s as f32 / 32768.0),
                 err_fn,
                 None,
             )
@@ -401,23 +407,45 @@ fn build_and_start_audio_stream(
 
 const UNDERRUN_DECAY: f32 = 0.995;
 
+struct AudioPlayback {
+    last_samples: Vec<i16>,
+    rebuffer_samples: usize,
+    buffering: bool,
+}
+
+impl AudioPlayback {
+    fn new(channels: usize, rebuffer_samples: usize) -> Self {
+        Self { last_samples: vec![0; channels.max(1)], rebuffer_samples, buffering: true }
+    }
+}
+
 fn fill_audio_buffer<S: Copy>(
     data: &mut [S],
     consumer: &mut HeapConsumer<i16>,
-    last_sample: &mut i16,
+    playback: &mut AudioPlayback,
     underrun_count: &AtomicU64,
     convert: impl Fn(i16) -> S,
 ) {
-    for slot in data.iter_mut() {
-        let sample = match consumer.pop() {
-            Some(s) => s,
-            None => {
-                underrun_count.fetch_add(1, Ordering::Relaxed);
-                (*last_sample as f32 * UNDERRUN_DECAY) as i16
-            }
-        };
-        *last_sample = sample;
-        *slot = convert(sample);
+    // Rebuild a small cushion after startup, a menu pause or an underrun.
+    // Otherwise every callback consumes each newly produced frame immediately.
+    if playback.buffering && consumer.len() >= (playback.rebuffer_samples + data.len()) {
+        playback.buffering = false;
+    }
+    let channels = playback.last_samples.len();
+    for frame in data.chunks_mut(channels) {
+        if !playback.buffering && consumer.len() < frame.len() {
+            playback.buffering = true;
+            underrun_count.fetch_add(1, Ordering::Relaxed);
+        }
+        for (channel, slot) in frame.iter_mut().enumerate() {
+            let sample = if playback.buffering {
+                (playback.last_samples[channel] as f32 * UNDERRUN_DECAY) as i16
+            } else {
+                consumer.pop().unwrap_or(0)
+            };
+            playback.last_samples[channel] = sample;
+            *slot = convert(sample);
+        }
     }
 }
 
@@ -509,16 +537,31 @@ struct RunningGame {
     save_path: PathBuf,
 }
 
-fn open_rom(bios_path: &str, rom_path: &Path, skip_bios: bool) -> Option<RunningGame> {
+fn load_game_pack_responsive(window: &mut Window, bios: &str, rom: &str) -> Option<GamePack> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let bios = bios.to_owned();
+    let rom = rom.to_owned();
+    window.set_title("GBA Emulator - Loading ROM...");
+    std::thread::spawn(move || { let _ = sender.send(GamePack::load(&bios, &rom)); });
+    let result = loop {
+        match receiver.try_recv() {
+            Ok(Ok(pack)) => break Some(pack),
+            Ok(Err(error)) => { error!("{}", error); break None; }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => { error!("ROM loader stopped unexpectedly"); break None; }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        window.update();
+        if !window.is_open() || window.is_key_down(Key::Escape) { break None; }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    window.set_title("GBA Emulator");
+    result
+}
+
+fn open_rom(window: &mut Window, bios_path: &str, rom_path: &Path, skip_bios: bool) -> Option<RunningGame> {
     let rom_path_string = rom_path.to_string_lossy().to_string();
     let t0 = Instant::now();
-    let game_pack = match GamePack::load(bios_path, &rom_path_string) {
-        Ok(pack) => pack,
-        Err(e) => {
-            error!("{}", e);
-            return None;
-        }
-    };
+    let game_pack = load_game_pack_responsive(window, bios_path, &rom_path_string)?;
     info!("[timing] GamePack::load: {:?}", t0.elapsed());
 
     let gba_pc = if skip_bios { 0x08000000 } else { 0x0 };
@@ -718,9 +761,7 @@ fn recreate_window(old: &Window, debugger_shown: bool, opts: &Opts, audio_active
     });
 
     new_window.set_position(position.0, position.1);
-    if !audio_active {
-        new_window.set_target_fps(opts.frame_cap.unwrap_or(60));
-    }
+    new_window.set_target_fps(opts.frame_cap.unwrap_or(if audio_active { 0 } else { 60 }));
 
     let new_menu = build_menu(&new_window, debugger_shown);
     (new_window, new_menu)
@@ -767,6 +808,9 @@ fn main() {
         log::error!("PANIC: {}", info);
     }));
 
+    if let Ok(path) = std::env::current_exe() {
+        info!("Executable: {}", path.display());
+    }
     let opts: Opts = Opts::parse();
     let mut gilrs = Gilrs::new().unwrap();
     let mut active_gamepad = None;
@@ -900,8 +944,8 @@ fn main() {
     {
         let rom_path = PathBuf::from(&rom_file);
         let gba_pc = if opts.skip_bios { 0x08000000 } else { 0x0 };
-        match GamePack::load(&bios_file, &rom_file) {
-            Ok(game_pack) => {
+        match load_game_pack_responsive(&mut window, &bios_file, &rom_file) {
+            Some(game_pack) => {
                 let mut gba = if let Some(ref save_path) = opts.save_state {
                     read_save_state(save_path, gba_pc, &game_pack)
                 } else {
@@ -916,10 +960,7 @@ fn main() {
                 }
                 Some(RunningGame { gba, game_pack, gba_pc, rom_path, save_path })
             }
-            Err(e) => {
-                error!("{}", e);
-                None
-            }
+            None => None,
         }
     } else {
         None
@@ -948,17 +989,6 @@ fn main() {
     let ring = HeapRb::<i16>::new(max_buffered_samples);
     let (mut audio_producer, audio_consumer) = ring.split();
 
-    let warmup_target_samples = (device_sample_rate as usize) * (device_channels as usize) / 5;
-    if let Some(game) = current.as_mut() {
-        while audio_producer.len() < warmup_target_samples {
-            game.gba.frame();
-            let new_samples = std::mem::take(&mut game.gba.apu.sample_buffer);
-            let resampled = resampler.process(&new_samples);
-            let device_samples = to_device_channels(&resampled, device_channels);
-            audio_producer.push_slice(&device_samples);
-        }
-    }
-
     let underrun_count = Arc::new(AtomicU64::new(0));
     let mut overrun_count: u64 = 0;
 
@@ -967,14 +997,12 @@ fn main() {
     });
     let audio_active = _audio_stream.is_some();
 
-    if !audio_active {
-        window.set_target_fps(opts.frame_cap.unwrap_or(60));
-    }
+    // Audio-paced execution owns its deadline; disable minifb's default 4 ms
+    // limiter so short event-pump iterations don't introduce another sleep.
+    window.set_target_fps(opts.frame_cap.unwrap_or(if audio_active { 0 } else { 60 }));
 
-    const GBA_FRAME_SECONDS: f64 = 280896.0 / 16777216.0;
-    const MAX_CATCHUP_FRAMES: u32 = 30;
+    const MAX_CATCHUP_FRAMES: u32 = 2;
     const TURBO_MULTIPLIER: f64 = 4.0;
-    const SLEEP_SAFETY_MARGIN_SECONDS: f64 = 0.002;
 
     let mut time_accumulator = 0.0f64;
     let mut last_instant = Instant::now();
@@ -983,7 +1011,7 @@ fn main() {
     let mut last_mouse_down = false;
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !should_exit {
-        let now = Instant::now();
+        let mut now = Instant::now();
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == app_menu.open_rom.id() {
@@ -997,7 +1025,7 @@ fn main() {
                         }
                         info!("[timing] write previous save: {:?}", save_start.elapsed());
                         let open_start = Instant::now();
-                        if let Some(new_game) = open_rom(&bios_path.to_string_lossy(), &rom_path, opts.skip_bios) {
+                        if let Some(new_game) = open_rom(&mut window, &bios_path.to_string_lossy(), &rom_path, opts.skip_bios) {
                             info!("[timing] open_rom total: {:?}", open_start.elapsed());
                             app_menu.refresh_state_slots(Some(&new_game.rom_path));
                             app_menu.set_game_loaded(true);
@@ -1069,6 +1097,11 @@ fn main() {
             } else if event.id == app_menu.debug_clear_breakpoints.id() {
                 debugger_state.breakpoints.clear();
             }
+            // Modal dialogs and paused time are not emulation time to catch up.
+            now = Instant::now();
+            last_instant = now;
+            time_accumulator = 0.0;
+
         }
 
         let turbo = window.is_key_down(Key::Space)
@@ -1137,6 +1170,10 @@ fn main() {
             }
         }
 
+        if paused || current.is_none() {
+            last_instant = Instant::now();
+            time_accumulator = 0.0;
+        }
         let mut frames_emulated: u32 = 0;
 
         match current.as_mut() {
@@ -1147,7 +1184,7 @@ fn main() {
                     if turbo {
                         dt *= TURBO_MULTIPLIER;
                     }
-                    time_accumulator = (time_accumulator + dt).min(GBA_FRAME_SECONDS * MAX_CATCHUP_FRAMES as f64);
+                    time_accumulator += dt.min(GBA_FRAME_SECONDS * if turbo { 8.0 } else { MAX_CATCHUP_FRAMES as f64 });
 
                     while time_accumulator >= GBA_FRAME_SECONDS {
                         let completed = emulate_frame(&mut game.gba, &debugger_state);
@@ -1172,13 +1209,6 @@ fn main() {
                         }
                     }
 
-                    if !turbo {
-                        let remaining = GBA_FRAME_SECONDS - time_accumulator;
-                        let sleep_secs = (remaining - SLEEP_SAFETY_MARGIN_SECONDS).max(0.0);
-                        if sleep_secs > 0.0 {
-                            std::thread::sleep(std::time::Duration::from_secs_f64(sleep_secs));
-                        }
-                    }
                 } else {
                     let frames_this_iteration = if turbo { TURBO_MULTIPLIER as usize } else { 1 };
                     for _ in 0..frames_this_iteration {
@@ -1240,6 +1270,13 @@ fn main() {
 
                 present(&mut window, &debugger_state, &mut debug_buf, &game.gba.gpu.frame_buffer, Some(&game.gba));
 
+                if audio_active && opts.frame_cap.is_none() && !turbo && !paused {
+                    let sleep_secs = frame_sleep_seconds(time_accumulator, now.elapsed().as_secs_f64());
+                    if sleep_secs > 0.0 {
+                        std::thread::sleep(std::time::Duration::from_secs_f64(sleep_secs));
+                    }
+                }
+
                 if opts.fps_counter && frames_emulated > 0 {
                     fps_counter_buffer.push_back(1f64 / now.elapsed().as_secs_f64());
                     if fps_counter_buffer.len() == FPS_BUFFER_SIZE {
@@ -1262,13 +1299,21 @@ fn main() {
             last_audio_stats_log = now;
             let underruns = underrun_count.swap(0, Ordering::Relaxed);
             if underruns > 0 || overrun_count > 0 {
-                info!("Audio buffer: {} underrun samples, {} overrun samples dropped (last 2s)", underruns, overrun_count);
+                info!("Audio buffer: {} underrun events, {} overrun samples dropped (last 2s)", underruns, overrun_count);
                 overrun_count = 0;
             }
         }
     }
 
     if let Some(game) = current.as_mut() {
+        if let Some(ref path) = opts.dump_bmp {
+            if let Err(err) = write_bmp(path, &game.gba.gpu.frame_buffer, WIDTH, HEIGHT) {
+                error!("Failed to write framebuffer dump: {}", err);
+            }
+        }
+        if let Some(ref path) = opts.dump_save_state {
+            write_save_state(&mut game.gba, path);
+        }
         write_save_file(&mut game.gba, &game.save_path.to_string_lossy().to_string());
     }
 }
@@ -1276,6 +1321,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_deadline_includes_emulation_and_presentation_time() {
+        // Castlevania gameplay takes about 12 ms. Sleeping a fresh frame after
+        // this work repeatedly starves the audio queue even on a fast enough CPU.
+        let sleep = frame_sleep_seconds(0.001, 0.012);
+        assert!((sleep - (GBA_FRAME_SECONDS - 0.015)).abs() < 1e-12);
+        assert_eq!(frame_sleep_seconds(0.001, 0.020), 0.0);
+    }
 
     #[test]
     fn save_path_for_rom_replaces_extension_with_sav() {
@@ -1360,10 +1414,10 @@ mod tests {
         let ring = HeapRb::<i16>::new(8);
         let (mut producer, mut consumer) = ring.split();
         producer.push_slice(&[100, -100, 200]);
-        let mut last_sample = 0i16;
+        let mut playback = AudioPlayback::new(1, 0);
         let underruns = AtomicU64::new(0);
         let mut data = [0i16; 3];
-        fill_audio_buffer(&mut data, &mut consumer, &mut last_sample, &underruns, |s| s);
+        fill_audio_buffer(&mut data, &mut consumer, &mut playback, &underruns, |s| s);
         assert_eq!(data, [100, -100, 200]);
         assert_eq!(underruns.load(Ordering::Relaxed), 0);
     }
@@ -1372,13 +1426,32 @@ mod tests {
     fn fill_audio_buffer_decays_instead_of_dropping_to_zero_on_underrun() {
         let ring = HeapRb::<i16>::new(8);
         let (_producer, mut consumer) = ring.split();
-        let mut last_sample = 1000i16;
+        let mut playback = AudioPlayback::new(1, 0);
+        playback.last_samples[0] = 1000;
         let underruns = AtomicU64::new(0);
         let mut data = [0i16; 3];
-        fill_audio_buffer(&mut data, &mut consumer, &mut last_sample, &underruns, |s| s);
+        fill_audio_buffer(&mut data, &mut consumer, &mut playback, &underruns, |s| s);
         assert!(data[0] > 0 && data[0] < 1000, "expected a decayed non-zero sample, got {}", data[0]);
         assert!(data[1] < data[0]);
         assert!(data[2] < data[1]);
-        assert_eq!(underruns.load(Ordering::Relaxed), 3);
+        assert!(playback.buffering);
     }
+    #[test]
+    fn underrun_preserves_stereo_channels_and_waits_for_a_cushion() {
+        let ring = HeapRb::<i16>::new(32);
+        let (mut producer, mut consumer) = ring.split();
+        let mut playback = AudioPlayback::new(2, 8);
+        playback.last_samples = vec![1000, -1000];
+        let underruns = AtomicU64::new(0);
+        producer.push_slice(&[200, -200]);
+        let mut data = [0i16; 4];
+        fill_audio_buffer(&mut data, &mut consumer, &mut playback, &underruns, |s| s);
+        assert!(data[0] > 0 && data[1] < 0);
+        assert_eq!(consumer.len(), 2);
+        producer.push_slice(&[300, -300, 400, -400, 500, -500, 600, -600, 700, -700]);
+        fill_audio_buffer(&mut data, &mut consumer, &mut playback, &underruns, |s| s);
+        assert_eq!(data, [200, -200, 300, -300]);
+        assert!(!playback.buffering);
+    }
+
 }
