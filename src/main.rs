@@ -27,8 +27,6 @@ const LOG_FILE_PATH: &str = "gba_emulator.log";
 const GBA_FRAME_SECONDS: f64 = 280896.0 / 16777216.0;
 
 fn frame_sleep_seconds(accumulator: f64, iteration_elapsed: f64) -> f64 {
-    // The accumulator was sampled at the start of the iteration. Emulation,
-    // input and presentation have already used part of the next frame's budget.
     const SAFETY_MARGIN: f64 = 0.002;
     (GBA_FRAME_SECONDS - accumulator - iteration_elapsed - SAFETY_MARGIN).max(0.0)
 }
@@ -46,8 +44,6 @@ impl log::Log for ConsoleLogger {
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
 
-            // The GUI detaches its console. A closed stdout must not panic
-            // inside the logger (or recursively inside the panic hook).
             let _ = writeln!(std::io::stdout(), "{}", record.args());
 
             if let Ok(mut guard) = LOG_FILE.lock() {
@@ -426,8 +422,6 @@ fn fill_audio_buffer<S: Copy>(
     underrun_count: &AtomicU64,
     convert: impl Fn(i16) -> S,
 ) {
-    // Rebuild a small cushion after startup, a menu pause or an underrun.
-    // Otherwise every callback consumes each newly produced frame immediately.
     if playback.buffering && consumer.len() >= (playback.rebuffer_samples + data.len()) {
         playback.buffering = false;
     }
@@ -997,8 +991,6 @@ fn main() {
     });
     let audio_active = _audio_stream.is_some();
 
-    // Audio-paced execution owns its deadline; disable minifb's default 4 ms
-    // limiter so short event-pump iterations don't introduce another sleep.
     window.set_target_fps(opts.frame_cap.unwrap_or(if audio_active { 0 } else { 60 }));
 
     const MAX_CATCHUP_FRAMES: u32 = 2;
@@ -1097,7 +1089,6 @@ fn main() {
             } else if event.id == app_menu.debug_clear_breakpoints.id() {
                 debugger_state.breakpoints.clear();
             }
-            // Modal dialogs and paused time are not emulation time to catch up.
             now = Instant::now();
             last_instant = now;
             time_accumulator = 0.0;
@@ -1324,8 +1315,6 @@ mod tests {
 
     #[test]
     fn frame_deadline_includes_emulation_and_presentation_time() {
-        // Castlevania gameplay takes about 12 ms. Sleeping a fresh frame after
-        // this work repeatedly starves the audio queue even on a fast enough CPU.
         let sleep = frame_sleep_seconds(0.001, 0.012);
         assert!((sleep - (GBA_FRAME_SECONDS - 0.015)).abs() < 1e-12);
         assert_eq!(frame_sleep_seconds(0.001, 0.020), 0.0);
